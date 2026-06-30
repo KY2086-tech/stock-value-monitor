@@ -17,6 +17,7 @@ import time
 import base64
 import tempfile
 import threading
+import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -36,11 +37,25 @@ except Exception:
 st.set_page_config(page_title="盤中大單進出監控", layout="wide")
 
 TW_TZ = ZoneInfo("Asia/Taipei")
-GROUP_EDIT_PIN = "0000"
+GROUP_EDIT_PIN = "1219"
 GROUPS_FILE = "stock_groups.json"
 BACKUP_DIR = "backups"
 STOCK_NAME_FILE = "TWstocklistname.txt"
 APP_LOGO = "jerry.jpg"
+
+
+def get_secret_or_default(key: str, default: str = ""):
+    """安全讀取 Streamlit Secrets；未設定時回傳預設值。"""
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
+# ===== Telegram 設定 =====
+TELEGRAM_BOT_TOKEN = get_secret_or_default("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = get_secret_or_default("TELEGRAM_CHAT_ID", "")
+
 YF_CLOSE_CACHE_FILE = "yf_yesterday_close_cache.json"
 YF_CLOSE_CACHE_TTL_SEC = 3600
 
@@ -58,8 +73,17 @@ DEFAULT_STOCK_GROUPS = {
 st.markdown(
     """
     <style>
+    html { scroll-behavior: smooth; }
+    .dashboard-link, .dashboard-link:link, .dashboard-link:visited, .dashboard-link:hover, .dashboard-link:active { text-decoration:none !important; color:inherit !important; display:block; }
+    .dash-card { cursor:pointer; transition:transform .12s ease, box-shadow .12s ease; }
+    .dash-card:hover { transform:translateY(-2px); box-shadow:0 4px 10px rgba(0,0,0,.12); }
     .dashboard-grid {display:grid; grid-template-columns:repeat(4,minmax(240px,1fr)); gap:12px; margin:10px 0 18px 0;}
-    .dash-card {border:1px solid #91d5ff; border-radius:12px; padding:14px 16px; min-height:170px; background:#f0f9ff; box-shadow:0 1px 2px rgba(0,0,0,.04);}
+    .dash-card {border:1px solid #91d5ff; border-radius:12px; padding:14px 16px; min-height:190px; background:#f0f9ff; box-shadow:0 1px 2px rgba(0,0,0,.04);}
+    /* 儀表板顏色依「漲幅達標比例」分級：0%、1~39%、40~69%、70%以上 */
+    .dash-card.pct-zero {border-color:#d9d9d9; background:#fafafa;}
+    .dash-card.pct-low {border-color:#91d5ff; background:#f0f9ff;}
+    .dash-card.pct-mid {border-color:#ffd666; background:#fffbe6;}
+    .dash-card.pct-high {border-color:#ff7875; background:#fff1f0; box-shadow:0 1px 8px rgba(207,19,34,.18);}
     .dash-card.hot {border-color:#ff9c6e; background:#fff7e6;}
     .dash-card.strong {border-color:#95de64; background:#f6ffed;}
     .dash-title {font-weight:800; font-size:18px; margin-bottom:8px; color:#111827;}
@@ -85,6 +109,12 @@ def yahoo_quote_url(symbol: str) -> str:
     """產生 Yahoo 台股個股頁連結。"""
     code = symbol_to_code(symbol)
     return f"https://tw.stock.yahoo.com/quote/{code}"
+
+
+def make_anchor_id(group_name: str) -> str:
+    """將分類名稱轉成穩定的 HTML 錨點 ID，讓儀表板卡片可跳到對應表格。"""
+    anchor = re.sub(r"[^0-9A-Za-z一-鿿]+", "-", str(group_name)).strip("-")
+    return f"group-{anchor or 'default'}"
 
 
 def format_price_value(value):
@@ -560,6 +590,7 @@ class FubonRealtimeManager:
                 "last_trade_type": "-",
                 "total_buy_vol": 0,
                 "total_sell_vol": 0,
+                "recent_tick_orders": [],
                 "latest_large_order": None,
             })
 
@@ -595,14 +626,17 @@ class FubonRealtimeManager:
                 elif trade_type == "內盤(賣)":
                     status["total_sell_vol"] = int(status.get("total_sell_vol", 0) or 0) + tick_volume
 
-                threshold = int(st.session_state.get("large_order_threshold", 50) or 50)
-                if tick_volume >= threshold:
-                    status["latest_large_order"] = {
-                        "time": now,
-                        "price": status.get("last_ws_price"),
-                        "volume": tick_volume,
-                        "type": status.get("last_trade_type", "-"),
-                    }
+                # 不在 WebSocket callback 內使用固定門檻過濾，避免 UI 調整大單張數後仍沿用舊門檻。
+                tick_order = {
+                    "time": now,
+                    "price": status.get("last_ws_price"),
+                    "volume": int(tick_volume),
+                    "type": status.get("last_trade_type", "-"),
+                }
+                recent_orders = status.get("recent_tick_orders", [])
+                recent_orders.append(tick_order)
+                status["recent_tick_orders"] = recent_orders[-200:]
+                status["latest_large_order"] = tick_order
 
             self.tick_status[symbol] = status
 
@@ -641,11 +675,19 @@ class FubonRealtimeManager:
                 "last_trade_type": "-",
                 "total_buy_vol": 0,
                 "total_sell_vol": 0,
+                "recent_tick_orders": [],
                 "latest_large_order": None,
             }))
-        latest = status.get("latest_large_order")
-        if latest and int(latest.get("volume") or 0) >= threshold:
-            status["large_order_text"] = self._format_large_order_text(latest)
+
+        latest_large_order = None
+        for order in reversed(status.get("recent_tick_orders", [])):
+            if int(order.get("volume") or 0) >= threshold:
+                latest_large_order = order
+                break
+
+        status["latest_large_order"] = latest_large_order
+        if latest_large_order:
+            status["large_order_text"] = self._format_large_order_text(latest_large_order)
         else:
             status["large_order_text"] = "監控中"
         return status
@@ -690,6 +732,28 @@ def save_backup_snapshot(groups):
 
 
 # =============================================================================
+# Telegram
+# =============================================================================
+def send_telegram_message(text: str):
+    """送出 Telegram 訊息；需要在 Streamlit secrets 設定 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID。"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    try:
+        res = requests.post(url, json=payload, timeout=5)
+        if res.status_code != 200:
+            st.error(f"Telegram 傳送失敗，API 回傳：{res.text}")
+    except Exception as e:
+        st.error(f"Telegram 連線失敗: {e}")
+
+
+# =============================================================================
 # Session State
 # =============================================================================
 if "auto_refresh_enabled" not in st.session_state:
@@ -698,6 +762,8 @@ if "refresh_sec" not in st.session_state:
     st.session_state.refresh_sec = 3
 if "large_order_threshold" not in st.session_state:
     st.session_state.large_order_threshold = 50
+if "telegram_pct_threshold" not in st.session_state:
+    st.session_state.telegram_pct_threshold = 3.0
 if "stock_groups" not in st.session_state:
     st.session_state.stock_groups = load_stock_groups()
 if "group_editor_unlocked" not in st.session_state:
@@ -718,6 +784,88 @@ if "fubon_manager" not in st.session_state:
     st.session_state.fubon_manager = FubonRealtimeManager()
 if "fubon_logged_in" not in st.session_state:
     st.session_state.fubon_logged_in = False
+if "tg_push_enabled" not in st.session_state:
+    st.session_state.tg_push_enabled = False
+if "large_order_toast_keys" not in st.session_state:
+    # 用來避免同一筆大單在自動刷新時重複跳出 toast / Telegram
+    st.session_state.large_order_toast_keys = set()
+if "_large_order_toast_messages" not in st.session_state:
+    # 大單買入 toast 佇列；資料掃描階段加入，畫面輸出前統一顯示
+    st.session_state._large_order_toast_messages = []
+
+
+def show_pending_toasts():
+    """顯示右上角 toast。duration='long' 約為 10 秒。"""
+    if "_quick_add_success_message" in st.session_state:
+        st.toast(st.session_state._quick_add_success_message, duration="long")
+        del st.session_state._quick_add_success_message
+
+    messages = st.session_state.get("_large_order_toast_messages", [])
+    if messages:
+        # 避免同一輪太多 toast 佔滿畫面，最多顯示最新 3 則
+        for msg in messages[-3:]:
+            st.toast(msg, icon="🚀", duration="long")
+        st.session_state._large_order_toast_messages = []
+
+
+def queue_large_buy_toast(group_name, code, stock_name, latest, change_pct):
+    """偵測到外盤買入大單時，加入 toast 佇列；若 Telegram 開啟則同步推送。"""
+    if not latest or latest.get("type") != "外盤(買)":
+        return
+
+    order_time = latest.get("time")
+    time_key = order_time.strftime("%Y%m%d%H%M%S") if hasattr(order_time, "strftime") else str(order_time)
+    volume = int(latest.get("volume") or 0)
+    price = latest.get("price")
+    toast_key = f"{code}_{time_key}_{volume}_{latest.get('type', '-')}_{price}"
+
+    # 同一筆大單只通知一次，避免自動刷新時重複跳出 toast / Telegram
+    if toast_key in st.session_state.large_order_toast_keys:
+        return
+
+    time_text = order_time.strftime("%H:%M:%S") if hasattr(order_time, "strftime") else "--:--:--"
+    price_text = f"{float(price):.2f}" if isinstance(price, (int, float)) else "-"
+    pct_text = format_pct_value(change_pct)
+
+    toast_msg = (
+        f"🚀 大單買入偵測\n"
+        f"{group_name}｜{code} {stock_name}\n"
+        f"單筆：{volume} 張｜價格：{price_text}\n"
+        f"時間：{time_text}｜漲幅：{pct_text}"
+    )
+    st.session_state._large_order_toast_messages.append(toast_msg)
+
+    should_send_telegram = False
+    try:
+        if change_pct is not None:
+            pct_threshold = abs(float(st.session_state.get("telegram_pct_threshold", 3.0) or 3.0))
+            should_send_telegram = abs(float(change_pct)) >= pct_threshold
+    except Exception:
+        should_send_telegram = False
+
+    if st.session_state.get("tg_push_enabled", False) and should_send_telegram:
+        yahoo_url = yahoo_quote_url(code)
+        telegram_msg = (
+            f"🚀 <b>大單買入偵測</b>\n"
+            f"分類：{group_name}\n"
+            f"股票：<a href='{yahoo_url}'>{code} {stock_name}</a>\n"
+            f"單筆：<b>{volume}</b> 張\n"
+            f"價格：<b>{price_text}</b>\n"
+            f"時間：{time_text}\n"
+            f"漲幅：{pct_text}\n"
+            f"推送門檻：±{pct_threshold:.1f}%"
+        )
+        send_telegram_message(telegram_msg)
+
+    st.session_state.large_order_toast_keys.add(toast_key)
+
+    # 控制記憶體，保留最近約 500 筆去重紀錄
+    if len(st.session_state.large_order_toast_keys) > 500:
+        st.session_state.large_order_toast_keys = set(list(st.session_state.large_order_toast_keys)[-300:])
+
+
+# 顯示上一輪 rerun 留下的提示，例如快速新增股票成功
+show_pending_toasts()
 
 
 def enter_edit_mode():
@@ -907,6 +1055,10 @@ def render_stock_group_editor():
                     st.session_state.stock_groups = groups
                     save_stock_groups(groups)
                     set_next_selected_group(selected_group)
+                    if stock_name:
+                        st.session_state._quick_add_success_message = f"已加入 {symbol}（{stock_name}）"
+                    else:
+                        st.session_state._quick_add_success_message = f"已加入 {symbol}"
                     st.rerun()
 
         c1, c2 = st.columns(2)
@@ -979,17 +1131,35 @@ if os.path.exists(APP_LOGO):
 else:
     st.markdown("## ⚡ 盤中大單進出監控")
 
-control_col1, control_col2, control_col3, control_col4, control_col5 = st.columns([1, 1, 1, 1, 1])
+control_col1, control_col2, control_col3, control_col4, control_col5, control_col6, control_col7 = st.columns([1, 1, 1, 1, 1, 1, 1])
 with control_col1:
     if st.button("🔄 手動刷新畫面", width="stretch"):
         st.rerun()
 with control_col2:
     st.toggle("⏱️ 自動刷新", key="auto_refresh_enabled")
 with control_col3:
-    st.number_input("刷新秒數", min_value=1, max_value=60, step=1, key="refresh_sec")
+    tg_push = st.toggle(
+        "📲 Telegram 推送開關",
+        value=st.session_state.tg_push_enabled,
+        help="必須開啟此選項，機器人才會依推送漲跌幅門檻發送大單買入推播",
+    )
+    if tg_push != st.session_state.tg_push_enabled:
+        st.session_state.tg_push_enabled = tg_push
+        st.rerun()
 with control_col4:
-    st.number_input("大單門檻（張）", min_value=1, step=10, key="large_order_threshold")
+    st.number_input("刷新秒數", min_value=1, max_value=60, step=1, key="refresh_sec")
 with control_col5:
+    st.number_input("大單門檻（張）", min_value=1, step=10, key="large_order_threshold")
+with control_col6:
+    st.number_input(
+        "推送漲跌幅門檻 (%)",
+        min_value=0.0,
+        max_value=10.0,
+        step=0.5,
+        key="telegram_pct_threshold",
+        help="Telegram 推送條件：漲跌幅絕對值 >= 此數字，且同時有大單買入。預設 3%。",
+    )
+with control_col7:
     pct_threshold = st.number_input("漲幅門檻 (%)", min_value=0.0, max_value=10.0, value=5.0, step=0.5)
 
 render_fubon_login()
@@ -1040,6 +1210,8 @@ for group_name, stocks in st.session_state.stock_groups.items():
     large_sell_count = 0
     pct_hit_count = 0
     known_pct_count = 0
+    up_count = 0
+    down_count = 0
     top_pct_items = []
     group_large_messages = []
 
@@ -1067,11 +1239,15 @@ for group_name, stocks in st.session_state.stock_groups.items():
 
         if change_pct is not None:
             known_pct_count += 1
+            if float(change_pct) > 0:
+                up_count += 1
+            elif float(change_pct) < 0:
+                down_count += 1
             top_pct_items.append({"code": code, "name": stock_name, "pct": float(change_pct)})
             if float(change_pct) >= float(pct_threshold):
                 pct_hit_count += 1
 
-        if latest and int(latest.get("volume") or 0) >= int(st.session_state.large_order_threshold):
+        if latest:
             large_order_count += 1
             if latest.get("type") == "外盤(買)":
                 large_buy_count += 1
@@ -1080,6 +1256,9 @@ for group_name, stocks in st.session_state.stock_groups.items():
             msg = {"group": group_name, "code": code, "name": stock_name, "text": large_text, "time": latest.get("time"), "pct": change_pct, "type": latest.get("type", "-")}
             group_large_messages.append(msg)
             recent_large_orders.append(msg)
+
+            # ✅ 右上角 toast + Telegram：監控到「外盤(買)」大單時通知
+            queue_large_buy_toast(group_name, code, stock_name, latest, change_pct)
 
         rows.append({
             "代碼": yahoo_quote_url(symbol),
@@ -1107,6 +1286,7 @@ for group_name, stocks in st.session_state.stock_groups.items():
         for item in group_large_messages[:3]
     ]) or "尚無大單"
 
+    pct_hit_ratio = (pct_hit_count / len(stocks) * 100) if len(stocks) else 0
     dashboard_items.append({
         "group": group_name,
         "total": len(stocks),
@@ -1115,29 +1295,47 @@ for group_name, stocks in st.session_state.stock_groups.items():
         "large_sell_count": large_sell_count,
         "pct_hit_count": pct_hit_count,
         "known_pct_count": known_pct_count,
+        "pct_hit_ratio": pct_hit_ratio,
+        "up_count": up_count,
+        "down_count": down_count,
         "top_pct_text": top_pct_text,
         "large_msg_text": large_msg_text,
     })
     group_tables[group_name] = pd.DataFrame(rows, columns=["代碼", "股票名稱", "大單追蹤", "即時價", "漲幅%", "最新單筆", "內外盤", "外盤累積", "內盤累積", "昨收日期", "昨收來源"])
 
+# 顯示本輪掃描到的大單買入 toast
+show_pending_toasts()
+
 # ===== 儀表板 =====
-st.markdown('<div id="dashboard-top"></div>', unsafe_allow_html=True)
+st.markdown('<div id="dashboard-top" style="scroll-margin-top: 90px;"></div>', unsafe_allow_html=True)
 st.markdown("### 📌 大單追蹤儀表板")
-st.caption(f"大單門檻：單筆 ≥ {st.session_state.large_order_threshold} 張｜漲幅達標門檻：≥ {pct_threshold:.1f}%｜yfinance 昨收快取：{YF_CLOSE_CACHE_TTL_SEC//60} 分鐘")
+st.caption(f"大單門檻：單筆 ≥ {st.session_state.large_order_threshold} 張｜漲幅達標門檻：≥ {pct_threshold:.1f}%｜Telegram 推送門檻：漲跌幅 ≥ ±{st.session_state.telegram_pct_threshold:.1f}%｜yfinance 昨收快取：{YF_CLOSE_CACHE_TTL_SEC//60} 分鐘")
 st.caption(f"昨收來源統計：yfinance 即時更新 {yf_source_count['yfinance']} 檔｜快取 {yf_source_count['cache']} 檔｜舊快取 {yf_source_count['stale cache']} 檔｜缺資料 {yf_source_count['missing']} 檔")
 
 card_html_parts = ['<div class="dashboard-grid">']
 for item in dashboard_items:
-    card_class = "dash-card hot" if item["large_order_count"] > 0 else "dash-card strong" if item["pct_hit_count"] > 0 else "dash-card"
+    pct_ratio = float(item.get("pct_hit_ratio", 0) or 0)
+    if pct_ratio >= 70:
+        card_class = "dash-card pct-high"
+    elif pct_ratio >= 40:
+        card_class = "dash-card pct-mid"
+    elif pct_ratio > 0:
+        card_class = "dash-card pct-low"
+    else:
+        card_class = "dash-card pct-zero"
+    anchor_id = make_anchor_id(item["group"])
     card_html_parts.append(
+        f'<a href="#{anchor_id}" class="dashboard-link" title="前往 {escape_html(item["group"])} 明細表；大數字 = 漲幅達標檔數 / 分組總檔數">'
         f'<div class="{card_class}">'
         f'<div class="dash-title">{escape_html(item["group"])}</div>'
-        f'<div class="dash-big">{item["large_order_count"]} / {item["total"]}</div>'
+        f'<div class="dash-big">{item["pct_hit_count"]} / {item["total"]}</div>'
+        f'<div class="dash-line">漲幅達標比例（≥{pct_threshold:.1f}%）：<b>{item["pct_hit_ratio"]:.0f}%</b></div>'
+        f'<div class="dash-line">🎯 達標：<b>{item["pct_hit_count"]}</b> 檔（有漲幅資料 {item["known_pct_count"]} 檔）</div>'
+        f'<div class="dash-line">🔴 一般上漲：<b>{item["up_count"]}</b>　🟢 下跌：<b>{item["down_count"]}</b></div>'
         f'<div class="dash-line">🚀 外盤大單：<b>{item["large_buy_count"]}</b>　📉 內盤大單：<b>{item["large_sell_count"]}</b></div>'
-        f'<div class="dash-line">📈 漲幅達標：<b>{item["pct_hit_count"]}</b> 檔（有漲幅資料 {item["known_pct_count"]} 檔）</div>'
         f'<div class="dash-small"><b>大單追蹤</b><br>{item["large_msg_text"]}</div>'
         f'<div class="dash-small"><b>漲幅排行</b><br>{item["top_pct_text"]}</div>'
-        f'</div>'
+        f'</div></a>'
     )
 card_html_parts.append('</div>')
 st.markdown("".join(card_html_parts), unsafe_allow_html=True)
@@ -1154,6 +1352,8 @@ st.divider()
 
 # ===== 明細表 =====
 for group_name, display_df in group_tables.items():
+    anchor_id = make_anchor_id(group_name)
+    st.markdown(f'<div id="{anchor_id}" style="scroll-margin-top: 90px;"></div>', unsafe_allow_html=True)
     table_header_col1, table_header_col2 = st.columns([8, 2])
     with table_header_col1:
         st.subheader(f"【{group_name}】({len(display_df)}檔)")
