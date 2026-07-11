@@ -1,12 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-盤中大單進出監控 - 純富邦 WebSocket 版
+盤中即時成交監控 - 純富邦 WebSocket 版
 
-重點：
-1. 富邦 WebSocket 負責盤中大單、單筆量、內外盤。
-2. yfinance 只用來抓「昨日收盤價」，一小時更新一次，並存入本地 JSON 歷史快取。
-3. 表格顯示：代碼 Yahoo 連結｜股票名稱｜大單追蹤｜即時價｜漲幅%｜最新單筆｜內外盤｜外盤累積｜內盤累積。
-4. 修正「最新單筆」：富邦 trades 回傳的 volume 常是盤中累積量，本版會用「本次累積量 - 上次累積量」換算單筆增量。
+目標：
+捕捉股價瞬間拉抬時的進場訊號。
+
+核心邏輯：
+1. 富邦 WebSocket 負責即時成交價、單筆量、內外盤。
+2. yfinance 只抓昨日收盤價，一小時更新一次，存入本地 JSON 快取。
+3. 使用「預估 30 秒成交量」提早判斷量能放大，不等完整 30 秒結束。
+4. 使用 5 秒 / 10 秒 / 30 秒漲幅捕捉瞬間拉抬。
+5. 使用外盤占比確認主動買盤。
+6. 使用最近 60 秒高低點追蹤，判斷突破高點或從低點急拉。
+7. 分成「預警」與「進場訊號」。
+8. 修正儀表板 HTML anchor UI 問題。
 """
 
 import os
@@ -17,7 +24,6 @@ import time
 import base64
 import tempfile
 import threading
-import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -34,30 +40,46 @@ try:
 except Exception:
     yf = None
 
-st.set_page_config(page_title="盤中大單進出監控", layout="wide")
+
+# =============================================================================
+# App Config
+# =============================================================================
+st.set_page_config(page_title="盤中瞬間拉抬進場監控", layout="wide")
 
 TW_TZ = ZoneInfo("Asia/Taipei")
+
 GROUP_EDIT_PIN = "1219"
 GROUPS_FILE = "stock_groups.json"
 BACKUP_DIR = "backups"
 STOCK_NAME_FILE = "TWstocklistname.txt"
 APP_LOGO = "jerry.jpg"
 
-
-def get_secret_or_default(key: str, default: str = ""):
-    """安全讀取 Streamlit Secrets；未設定時回傳預設值。"""
-    try:
-        return st.secrets.get(key, default)
-    except Exception:
-        return default
-
-
-# ===== Telegram 設定 =====
-TELEGRAM_BOT_TOKEN = get_secret_or_default("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = get_secret_or_default("TELEGRAM_CHAT_ID", "")
+SIGNAL_LOG_DIR = "signal_logs"
+SIGNAL_LOG_LOCK = threading.RLock()
 
 YF_CLOSE_CACHE_FILE = "yf_yesterday_close_cache.json"
 YF_CLOSE_CACHE_TTL_SEC = 3600
+
+# 進場訊號預設參數
+DEFAULT_ENTRY_BUCKET_SEC = 30
+DEFAULT_ENTRY_TRACK_SEC = 60
+DEFAULT_ENTRY_VOLUME_RATIO = 1.3
+DEFAULT_ENTRY_PRICE_MOVE_PCT = 2.0
+DEFAULT_EARLY_5S_PCT = 0.8
+DEFAULT_EARLY_10S_PCT = 1.2
+DEFAULT_BUY_PRESSURE_RATIO = 0.55
+DEFAULT_SIGNAL_COOLDOWN_SEC = 45
+DEFAULT_MIN_CURRENT_VOLUME = 20
+
+# --- 急漲即時偵測新增參數 ---
+# 2 秒極短窗口漲幅門檻（用來抓最快速的瞬間拉抬，比 5 秒窗更靈敏）
+DEFAULT_EARLY_2S_PCT = 0.5
+# 單筆跳動門檻：最新一筆成交價相較「前一筆成交價」的漲幅，抓單筆巨量瞬間跳價
+DEFAULT_TICK_JUMP_PCT = 0.5
+# 量能視窗內至少要有幾筆成交，避免單一大單假突破
+DEFAULT_MIN_TICKS_IN_BUCKET = 2
+# 量能視窗投影時，經過秒數的下限，避免視窗剛開始 1~2 秒就被單筆巨量放大成離譜倍數
+BUCKET_ELAPSED_FLOOR_SEC = 3.0
 
 DEFAULT_STOCK_GROUPS = {
     "權值股": [
@@ -70,33 +92,152 @@ DEFAULT_STOCK_GROUPS = {
     ],
 }
 
+
+# =============================================================================
+# CSS
+# =============================================================================
 st.markdown(
     """
     <style>
     html { scroll-behavior: smooth; }
-    .dashboard-link, .dashboard-link:link, .dashboard-link:visited, .dashboard-link:hover, .dashboard-link:active { text-decoration:none !important; color:inherit !important; display:block; }
-    .dash-card { cursor:pointer; transition:transform .12s ease, box-shadow .12s ease; }
-    .dash-card:hover { transform:translateY(-2px); box-shadow:0 4px 10px rgba(0,0,0,.12); }
-    .dashboard-grid {display:grid; grid-template-columns:repeat(4,minmax(240px,1fr)); gap:12px; margin:10px 0 18px 0;}
-    .dash-card {border:1px solid #91d5ff; border-radius:12px; padding:14px 16px; min-height:190px; background:#f0f9ff; box-shadow:0 1px 2px rgba(0,0,0,.04);}
-    /* 儀表板顏色依「漲幅達標比例」分級：0%、1~39%、40~69%、70%以上 */
-    .dash-card.pct-zero {border-color:#d9d9d9; background:#fafafa;}
-    .dash-card.pct-low {border-color:#91d5ff; background:#f0f9ff;}
-    .dash-card.pct-mid {border-color:#ffd666; background:#fffbe6;}
-    .dash-card.pct-high {border-color:#ff7875; background:#fff1f0; box-shadow:0 1px 8px rgba(207,19,34,.18);}
-    .dash-card.hot {border-color:#ff9c6e; background:#fff7e6;}
-    .dash-card.strong {border-color:#95de64; background:#f6ffed;}
-    .dash-title {font-weight:800; font-size:18px; margin-bottom:8px; color:#111827;}
-    .dash-big {font-size:28px; font-weight:900; margin:4px 0 10px 0;}
-    .dash-line {font-size:14px; line-height:1.65; color:#111827;}
-    .dash-small {font-size:12px; color:#4b5563; margin-top:8px; border-top:1px solid rgba(0,0,0,.08); padding-top:8px;}
-    .up-text {color:#cf1322; font-weight:700;} .down-text {color:#389e0d; font-weight:700;} .flat-text {color:#6b7280; font-weight:700;}
-    @media (max-width:1200px){.dashboard-grid{grid-template-columns:repeat(2,minmax(240px,1fr));}}
-    @media (max-width:700px){.dashboard-grid{grid-template-columns:1fr;}}
+
+    .dashboard-grid {
+        display:grid;
+        grid-template-columns:repeat(4,minmax(260px,1fr));
+        gap:14px;
+        margin:14px 0 22px 0;
+    }
+
+    .dashboard-link,
+    .dashboard-link:link,
+    .dashboard-link:visited,
+    .dashboard-link:hover,
+    .dashboard-link:active {
+        text-decoration:none !important;
+        color:inherit !important;
+        display:block !important;
+    }
+
+    .dash-card {
+        border:1px solid #91d5ff;
+        border-radius:14px;
+        padding:16px 18px;
+        min-height:210px;
+        background:#f0f9ff;
+        box-shadow:0 1px 3px rgba(0,0,0,.08);
+        color:#111827;
+        cursor:pointer;
+        transition:transform .12s ease, box-shadow .12s ease;
+    }
+
+    .dash-card:hover {
+        transform:translateY(-2px);
+        box-shadow:0 6px 16px rgba(0,0,0,.18);
+    }
+
+    .dash-card.normal {
+        border-color:#91d5ff;
+        background:#f0f9ff;
+    }
+
+    .dash-card.warn {
+        border-color:#ffd666;
+        background:#fffbe6;
+    }
+
+    .dash-card.entry {
+        border-color:#ff4d4f;
+        background:#fff1f0;
+        box-shadow:0 1px 10px rgba(207,19,34,.20);
+    }
+
+    .dash-card.idle {
+        border-color:#d9d9d9;
+        background:#fafafa;
+    }
+
+    .dash-card.flash {
+        border-color:#ffa940;
+        background:#fff7e6;
+        box-shadow:0 1px 8px rgba(250,140,22,.18);
+    }
+
+    .dash-title {
+        font-weight:900;
+        font-size:18px;
+        margin-bottom:8px;
+        color:#111827;
+    }
+
+    .dash-big {
+        font-size:30px;
+        font-weight:950;
+        margin:4px 0 10px 0;
+        color:#111827 !important;
+        letter-spacing:.3px;
+    }
+
+    .dash-line {
+        font-size:14px;
+        line-height:1.65;
+        color:#111827;
+    }
+
+    .dash-small {
+        font-size:12px;
+        color:#374151;
+        margin-top:9px;
+        border-top:1px solid rgba(0,0,0,.12);
+        padding-top:8px;
+        line-height:1.55;
+    }
+
+    .up-text {
+        color:#cf1322;
+        font-weight:800;
+    }
+
+    .down-text {
+        color:#389e0d;
+        font-weight:800;
+    }
+
+    .flat-text {
+        color:#6b7280;
+        font-weight:800;
+    }
+
+    .return-link-wrap {
+        text-align:right;
+        padding-top:0.6rem;
+    }
+
+    .return-link-wrap a {
+        color:#1677ff;
+        font-weight:700;
+        text-decoration:none;
+    }
+
+    .return-link-wrap a:hover {
+        text-decoration:underline;
+    }
+
+    @media (max-width:1400px) {
+        .dashboard-grid {
+            grid-template-columns:repeat(2,minmax(260px,1fr));
+        }
+    }
+
+    @media (max-width:760px) {
+        .dashboard-grid {
+            grid-template-columns:1fr;
+        }
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
+
 
 # =============================================================================
 # 基礎工具
@@ -106,19 +247,26 @@ def symbol_to_code(symbol: str) -> str:
 
 
 def yahoo_quote_url(symbol: str) -> str:
-    """產生 Yahoo 台股個股頁連結。"""
     code = symbol_to_code(symbol)
     return f"https://tw.stock.yahoo.com/quote/{code}"
 
 
 def make_anchor_id(group_name: str) -> str:
-    """將分類名稱轉成穩定的 HTML 錨點 ID，讓儀表板卡片可跳到對應表格。"""
     anchor = re.sub(r"[^0-9A-Za-z一-鿿]+", "-", str(group_name)).strip("-")
     return f"group-{anchor or 'default'}"
 
 
+def escape_html(text_value):
+    return (
+        str(text_value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
 def format_price_value(value):
-    """格式化富邦 WebSocket 即時價。"""
     if value is None:
         return "-"
     try:
@@ -141,6 +289,36 @@ def format_pct_value(value):
     return "⚪ 0.00%"
 
 
+def format_signed_pct(value):
+    if value is None:
+        return "-"
+    try:
+        value = float(value)
+    except Exception:
+        return "-"
+    if value > 0:
+        return f"+{value:.2f}%"
+    return f"{value:.2f}%"
+
+
+def format_ratio_value(value):
+    if value is None:
+        return "-"
+    try:
+        return f"{float(value):.2f}x"
+    except Exception:
+        return "-"
+
+
+def format_percent_ratio(value):
+    if value is None:
+        return "-"
+    try:
+        return f"{float(value) * 100:.0f}%"
+    except Exception:
+        return "-"
+
+
 def pct_class(value):
     if value is None:
         return "flat-text"
@@ -155,30 +333,72 @@ def pct_class(value):
     return "flat-text"
 
 
-def escape_html(text_value):
-    return str(text_value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+def normalize_symbol_quick(input_text: str):
+    s = str(input_text).strip().upper()
+    if not s:
+        return None
+    if "." in s:
+        return s
+    if s.isdigit():
+        if s.startswith(("3", "6", "8")):
+            return f"{s}.TWO"
+        return f"{s}.TW"
+    return s
+
+
+def normalize_symbols_from_text(text: str):
+    if not text:
+        return []
+
+    text = text.replace("，", ",")
+    items = []
+
+    for raw_line in text.splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        items.extend([p.strip().upper() for p in raw_line.split(",") if p.strip()])
+
+    result, seen = [], set()
+
+    for item in items:
+        symbol = normalize_symbol_quick(item)
+        if symbol and symbol not in seen:
+            seen.add(symbol)
+            result.append(symbol)
+
+    return result
 
 
 def build_yfinance_candidates(symbol: str):
     raw = str(symbol).strip().upper()
     code = symbol_to_code(raw)
+
     candidates = []
+
     if raw and "." in raw:
         candidates.append(raw)
     elif raw:
         normalized = normalize_symbol_quick(raw)
         if normalized:
             candidates.append(normalized)
+
     if code:
         candidates.extend([f"{code}.TW", f"{code}.TWO"])
+
     result, seen = [], set()
+
     for item in candidates:
         if item and item not in seen:
             seen.add(item)
             result.append(item)
+
     return result
 
 
+# =============================================================================
+# yfinance 昨收快取
+# =============================================================================
 def load_yf_close_cache():
     if not os.path.exists(YF_CLOSE_CACHE_FILE):
         return {}
@@ -199,7 +419,6 @@ def save_yf_close_cache(cache: dict):
 
 
 def get_yfinance_yesterday_close(symbol: str):
-    """取得昨日/前一交易日收盤價；一小時內讀本地 JSON 快取，超過才重新抓 yfinance。"""
     code = symbol_to_code(symbol)
     now_ts = time.time()
     cache = load_yf_close_cache()
@@ -218,75 +437,74 @@ def get_yfinance_yesterday_close(symbol: str):
 
     last_error = ""
     today = datetime.now(TW_TZ).date()
+
     for yf_symbol in build_yfinance_candidates(symbol):
         try:
-            df = yf.download(yf_symbol, period="10d", interval="1d", auto_adjust=False, progress=False, threads=False)
+            df = yf.download(
+                yf_symbol,
+                period="10d",
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+
             if df is None or df.empty:
                 last_error = f"{yf_symbol}: no data"
                 continue
+
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+
             df = df.reset_index()
-            date_col = "Date" if "Date" in df.columns else "Datetime" if "Datetime" in df.columns else df.columns[0]
+
+            if "Date" in df.columns:
+                date_col = "Date"
+            elif "Datetime" in df.columns:
+                date_col = "Datetime"
+            else:
+                date_col = df.columns[0]
+
             df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
             df = df.dropna(subset=[date_col])
             df = df[df[date_col].dt.date < today].sort_values(date_col)
+
             if df.empty or "Close" not in df.columns:
                 last_error = f"{yf_symbol}: no previous close"
                 continue
+
             close = pd.to_numeric(df["Close"], errors="coerce").dropna()
+
             if close.empty:
                 last_error = f"{yf_symbol}: close empty"
                 continue
+
             close_value = float(close.iloc[-1])
             close_date = pd.to_datetime(df.loc[close.index[-1], date_col]).date().isoformat()
-            cache[code] = {"symbol": yf_symbol, "close": close_value, "date": close_date, "fetched_at": now_ts, "fetched_at_text": datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")}
+
+            cache[code] = {
+                "symbol": yf_symbol,
+                "close": close_value,
+                "date": close_date,
+                "fetched_at": now_ts,
+                "fetched_at_text": datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
             save_yf_close_cache(cache)
             return close_value, close_date, "yfinance"
+
         except Exception as e:
             last_error = f"{yf_symbol}: {e}"
             continue
 
     if isinstance(cached, dict) and cached.get("close") is not None:
         return float(cached["close"]), cached.get("date", ""), "stale cache"
+
     return None, "", last_error or "no data"
 
 
-def normalize_symbol_quick(input_text: str):
-    s = str(input_text).strip().upper()
-    if not s:
-        return None
-    if "." in s:
-        return s
-    if s.isdigit():
-        if s.startswith(("3", "6", "8")):
-            return f"{s}.TWO"
-        return f"{s}.TW"
-    return s
-
-
-def normalize_symbols_from_text(text: str):
-    if not text:
-        return []
-    text = text.replace("，", ",")
-    items = []
-    for raw_line in text.splitlines():
-        raw_line = raw_line.strip()
-        if not raw_line:
-            continue
-        items.extend([p.strip().upper() for p in raw_line.split(",") if p.strip()])
-
-    result, seen = [], set()
-    for item in items:
-        symbol = normalize_symbol_quick(item)
-        if symbol and symbol not in seen:
-            seen.add(symbol)
-            result.append(symbol)
-    return result
-
-
 # =============================================================================
-# 股票名稱 / 查詢：只讀本地 TWstocklistname.txt
+# 股票名稱 / 查詢
 # =============================================================================
 @st.cache_data(ttl=86400)
 def load_stock_lookup_maps(file_path: str = STOCK_NAME_FILE) -> dict:
@@ -295,18 +513,25 @@ def load_stock_lookup_maps(file_path: str = STOCK_NAME_FILE) -> dict:
     name_to_symbol = {}
 
     if not os.path.exists(file_path):
-        return {"code_to_name": code_to_name, "code_to_symbol": code_to_symbol, "name_to_symbol": name_to_symbol}
+        return {
+            "code_to_name": code_to_name,
+            "code_to_symbol": code_to_symbol,
+            "name_to_symbol": name_to_symbol,
+        }
 
     with open(file_path, "r", encoding="utf-8") as f:
         for raw_line in f:
             line = raw_line.strip().replace("\ufeff", "").replace("\u3000", " ")
+
             if not line:
                 continue
+
             if "\t" in line:
                 parts = [p.strip() for p in line.split("\t") if p.strip()]
             else:
                 m = re.match(r"^([^\s]+)\s+(.+)$", line)
                 parts = [m.group(1).strip(), m.group(2).strip()] if m else []
+
             if len(parts) < 2:
                 continue
 
@@ -314,14 +539,20 @@ def load_stock_lookup_maps(file_path: str = STOCK_NAME_FILE) -> dict:
             stock_name = parts[1].strip()
             symbol = normalize_symbol_quick(raw_symbol)
             code = symbol_to_code(symbol)
+
             if not code or not stock_name:
                 continue
+
             code_to_name[code] = stock_name
             code_to_symbol[code] = symbol
             name_to_symbol[stock_name] = symbol
             name_to_symbol[stock_name.replace(" ", "")] = symbol
 
-    return {"code_to_name": code_to_name, "code_to_symbol": code_to_symbol, "name_to_symbol": name_to_symbol}
+    return {
+        "code_to_name": code_to_name,
+        "code_to_symbol": code_to_symbol,
+        "name_to_symbol": name_to_symbol,
+    }
 
 
 @st.cache_data(ttl=86400)
@@ -333,36 +564,44 @@ def get_stock_name(symbol: str) -> str:
 
 def resolve_stock_query(input_text: str):
     q_raw = str(input_text).strip()
+
     if not q_raw:
         return None, None, None
+
     lookup = load_stock_lookup_maps(STOCK_NAME_FILE)
     code_to_name = lookup.get("code_to_name", {})
     code_to_symbol = lookup.get("code_to_symbol", {})
     name_to_symbol = lookup.get("name_to_symbol", {})
 
     q_upper = q_raw.upper()
+
     if "." in q_upper:
         code = symbol_to_code(q_upper)
         return q_upper, code_to_name.get(code, code), "ticker"
+
     if q_upper.isdigit():
         symbol = code_to_symbol.get(q_upper) or normalize_symbol_quick(q_upper)
         return symbol, code_to_name.get(q_upper, q_upper), "code"
 
     symbol = name_to_symbol.get(q_raw) or name_to_symbol.get(q_raw.replace(" ", ""))
+
     if symbol:
         code = symbol_to_code(symbol)
         return symbol, code_to_name.get(code, q_raw), "name"
 
     compact = q_raw.replace(" ", "")
+
     for stock_name, candidate_symbol in name_to_symbol.items():
         if compact and compact in stock_name.replace(" ", ""):
             code = symbol_to_code(candidate_symbol)
             return candidate_symbol, code_to_name.get(code, stock_name), "name_partial"
 
     symbol = normalize_symbol_quick(q_raw)
+
     if symbol:
         code = symbol_to_code(symbol)
         return symbol, code_to_name.get(code, code), "fallback"
+
     return None, None, None
 
 
@@ -392,6 +631,7 @@ class FubonRealtimeManager:
     def login(self, fubon_id: str, fubon_password: str, cert_password: str, pfx_base64: str):
         if FubonSDK is None:
             raise RuntimeError("富邦 SDK 尚未安裝或載入失敗")
+
         try:
             if self.ws is not None:
                 self.ws.disconnect()
@@ -410,12 +650,15 @@ class FubonRealtimeManager:
             self.tick_status = {}
 
         pfx_base64 = str(pfx_base64).strip()
+
         if "," in pfx_base64 and "base64" in pfx_base64[:80].lower():
             pfx_base64 = pfx_base64.split(",", 1)[1].strip()
+
         try:
             cert_bytes = base64.b64decode(pfx_base64, validate=True)
         except Exception as e:
             raise RuntimeError(f"pfx_base64 不是有效的 Base64 憑證資料：{e}")
+
         if not cert_bytes:
             raise RuntimeError("pfx_base64 解碼後是空資料")
 
@@ -426,29 +669,41 @@ class FubonRealtimeManager:
 
         sdk = None
         ws = None
+
         try:
             sdk = FubonSDK()
-            login_result = sdk.login(fubon_id.strip().upper(), fubon_password, self.cert_path, cert_password)
+            login_result = sdk.login(
+                fubon_id.strip().upper(),
+                fubon_password,
+                self.cert_path,
+                cert_password,
+            )
+
             is_success = getattr(login_result, "is_success", None)
             message = getattr(login_result, "message", None)
+
             if is_success is False:
                 raise RuntimeError(f"富邦登入失敗：{message or login_result}")
+
             sdk.init_realtime()
             ws = sdk.marketdata.websocket_client.stock
             ws.on("message", self._on_message)
             ws.connect()
+
             with self.lock:
                 self.sdk = sdk
                 self.ws = ws
                 self.logged_in = True
                 self.connected = True
                 self.error = None
+
         except Exception as e:
             try:
                 if ws is not None:
                     ws.disconnect()
             except Exception:
                 pass
+
             with self.lock:
                 self.sdk = None
                 self.ws = None
@@ -459,6 +714,7 @@ class FubonRealtimeManager:
                 self.subscribed = set()
                 self.last_message_at = None
                 self.tick_status = {}
+
             raise
 
     def _parse_message(self, message):
@@ -467,8 +723,10 @@ class FubonRealtimeManager:
                 return json.loads(message)
             except Exception:
                 return {"raw_text": message}
+
         if isinstance(message, dict):
             return message
+
         return {"raw_unknown": str(message)}
 
     def _safe_float(self, value):
@@ -477,6 +735,7 @@ class FubonRealtimeManager:
                 return None
         except Exception:
             pass
+
         try:
             return float(str(value).strip().replace(",", ""))
         except Exception:
@@ -492,126 +751,232 @@ class FubonRealtimeManager:
         data = msg.get("data", {})
         if not isinstance(data, dict):
             data = {}
-        symbol = data.get("symbol") or msg.get("symbol") or data.get("stockNo") or msg.get("stockNo")
+
+        symbol = (
+            data.get("symbol")
+            or msg.get("symbol")
+            or data.get("stockNo")
+            or msg.get("stockNo")
+        )
+
         return symbol_to_code(symbol) if symbol else None
 
     def _extract_price(self, msg):
         data = msg.get("data", {})
         if not isinstance(data, dict):
             data = {}
+
         candidates = [
-            data.get("price"), data.get("tradePrice"), data.get("lastPrice"),
-            data.get("close"), data.get("closePrice"),
-            msg.get("price"), msg.get("tradePrice"), msg.get("lastPrice"),
-            msg.get("close"), msg.get("closePrice"),
+            data.get("price"),
+            data.get("tradePrice"),
+            data.get("lastPrice"),
+            data.get("close"),
+            data.get("closePrice"),
+            msg.get("price"),
+            msg.get("tradePrice"),
+            msg.get("lastPrice"),
+            msg.get("close"),
+            msg.get("closePrice"),
         ]
+
         for value in candidates:
             price = self._safe_float(value)
             if price is not None:
                 return price
+
         return None
 
     def _extract_cumulative_volume(self, msg):
-        """讀取富邦 trades 的累積成交量欄位。
-
-        目前畫面中「最新單筆」出現 14780、95466 等大數字，代表來源欄位其實是盤中累積成交量，
-        所以不能直接顯示；必須在 _on_message 內用差值換算單筆量。
-        """
         data = msg.get("data", {})
         if not isinstance(data, dict):
             data = {}
+
         candidates = [
-            data.get("volume"), data.get("tradeVolume"), data.get("totalVolume"), data.get("total_volume"),
-            data.get("accVolume"), data.get("accTradeVolume"), data.get("cumulativeVolume"),
-            msg.get("volume"), msg.get("tradeVolume"), msg.get("totalVolume"), msg.get("total_volume"),
-            msg.get("accVolume"), msg.get("accTradeVolume"), msg.get("cumulativeVolume"),
+            data.get("volume"),
+            data.get("tradeVolume"),
+            data.get("totalVolume"),
+            data.get("total_volume"),
+            data.get("accVolume"),
+            data.get("accTradeVolume"),
+            data.get("cumulativeVolume"),
+            msg.get("volume"),
+            msg.get("tradeVolume"),
+            msg.get("totalVolume"),
+            msg.get("total_volume"),
+            msg.get("accVolume"),
+            msg.get("accTradeVolume"),
+            msg.get("cumulativeVolume"),
         ]
+
         for value in candidates:
             volume = self._safe_int(value)
             if volume is not None:
                 return volume
+
+        return None
+
+    def _extract_tick_size(self, msg):
+        data = msg.get("data", {})
+        if not isinstance(data, dict):
+            data = {}
+
+        candidates = [
+            data.get("size"),
+            data.get("tradeSize"),
+            data.get("trade_size"),
+            data.get("quantity"),
+            data.get("qty"),
+            msg.get("size"),
+            msg.get("tradeSize"),
+            msg.get("trade_size"),
+            msg.get("quantity"),
+            msg.get("qty"),
+        ]
+
+        for value in candidates:
+            size = self._safe_int(value)
+            if size is not None:
+                return size
+
         return None
 
     def _extract_trade_type(self, msg, price=None):
         data = msg.get("data", {})
         if not isinstance(data, dict):
             data = {}
+
         candidates = [
-            data.get("tradeType"), data.get("tickType"), data.get("type"), data.get("side"), data.get("dealType"),
-            msg.get("tradeType"), msg.get("tickType"), msg.get("type"), msg.get("side"), msg.get("dealType"),
+            data.get("tradeType"),
+            data.get("tickType"),
+            data.get("type"),
+            data.get("side"),
+            data.get("dealType"),
+            msg.get("tradeType"),
+            msg.get("tickType"),
+            msg.get("type"),
+            msg.get("side"),
+            msg.get("dealType"),
         ]
-        raw_type = next((str(x).strip() for x in candidates if x is not None and str(x).strip()), "")
+
+        raw_type = next(
+            (str(x).strip() for x in candidates if x is not None and str(x).strip()),
+            "",
+        )
+
         raw_upper = raw_type.upper()
+
         if raw_upper in ["BUY", "B", "BID", "外盤", "外盤(買)", "買", "1"]:
             return "外盤(買)"
+
         if raw_upper in ["SELL", "S", "ASK", "內盤", "內盤(賣)", "賣", "2"]:
             return "內盤(賣)"
 
-        # 若未提供內外盤欄位，嘗試用成交價與買一/賣一判斷。
         if price is not None:
-            bid = self._safe_float(data.get("bid") or data.get("bidPrice") or data.get("bestBidPrice") or msg.get("bid") or msg.get("bidPrice"))
-            ask = self._safe_float(data.get("ask") or data.get("askPrice") or data.get("bestAskPrice") or msg.get("ask") or msg.get("askPrice"))
+            bid = self._safe_float(
+                data.get("bid")
+                or data.get("bidPrice")
+                or data.get("bestBidPrice")
+                or msg.get("bid")
+                or msg.get("bidPrice")
+            )
+
+            ask = self._safe_float(
+                data.get("ask")
+                or data.get("askPrice")
+                or data.get("bestAskPrice")
+                or msg.get("ask")
+                or msg.get("askPrice")
+            )
+
             if ask is not None and price >= ask:
                 return "外盤(買)"
+
             if bid is not None and price <= bid:
                 return "內盤(賣)"
+
         return "-"
 
-    def _format_large_order_text(self, large_order):
-        if not large_order:
-            return "監控中"
-        lo_time = large_order.get("time")
-        time_text = lo_time.strftime("%H:%M:%S") if hasattr(lo_time, "strftime") else "--:--:--"
-        price = large_order.get("price")
-        price_text = f"@{price:.2f}" if isinstance(price, (int, float)) else ""
-        volume = large_order.get("volume")
-        trade_type = large_order.get("type") or "-"
-        icon = "🚀" if trade_type == "外盤(買)" else "📉" if trade_type == "內盤(賣)" else "🔔"
-        return f"{icon} {time_text} {volume}張 {price_text} {trade_type}"
+    def _default_status(self):
+        return {
+            "last_ws_price": None,
+            "last_cumulative_volume": None,
+            "real_tick_volume": None,
+            "last_trade_type": "-",
+            "total_buy_vol": 0,
+            "total_sell_vol": 0,
+            "recent_ticks": [],
+            "price_points": [],
+            "entry_state": {
+                "armed": False,
+                "armed_at": None,
+                "armed_low": None,
+                "armed_high": None,
+                "last_signal_at": None,
+            },
+        }
 
     def _on_message(self, message):
         msg = self._parse_message(message)
         now = datetime.now(TW_TZ)
+
         symbol = self._extract_symbol(msg)
         price = self._extract_price(msg)
+        direct_tick_size = self._extract_tick_size(msg)
         cumulative_volume = self._extract_cumulative_volume(msg)
         trade_type = self._extract_trade_type(msg, price)
 
         with self.lock:
             self.last_message_at = now
+
             if not symbol:
                 return
-            self.messages[symbol] = {"time": now, "raw": msg}
 
-            status = self.tick_status.get(symbol, {
-                "last_ws_price": None,
-                "last_cumulative_volume": None,
-                "real_tick_volume": None,
-                "last_trade_type": "-",
-                "total_buy_vol": 0,
-                "total_sell_vol": 0,
-                "recent_tick_orders": [],
-                "latest_large_order": None,
-            })
+            self.messages[symbol] = {
+                "time": now,
+                "raw": msg,
+            }
+
+            status = self.tick_status.get(symbol, self._default_status())
+
+            if "entry_state" not in status:
+                status["entry_state"] = self._default_status()["entry_state"]
 
             if price is not None:
                 status["last_ws_price"] = price
 
-            # ===== 重點修正：累積量轉單筆量 =====
-            # 富邦 trades 的 volume 常是「盤中累積成交量」。
-            # 第一筆收到時沒有前值可扣，因此不當作單筆大單；第二筆後用差值才是真正最新單筆。
+                price_points = status.get("price_points", [])
+                price_points.append({
+                    "time": now,
+                    "price": float(price),
+                })
+
+                status["price_points"] = [
+                    p for p in price_points
+                    if hasattr(p.get("time"), "timestamp")
+                    and (now - p.get("time")).total_seconds() <= 300
+                ][-1500:]
+
             tick_volume = None
-            if cumulative_volume is not None:
+
+            if direct_tick_size is not None:
+                tick_volume = int(direct_tick_size)
+
+                if cumulative_volume is not None:
+                    status["last_cumulative_volume"] = int(cumulative_volume)
+
+            elif cumulative_volume is not None:
                 prev_cum = status.get("last_cumulative_volume")
+
                 if prev_cum is not None:
                     diff = int(cumulative_volume) - int(prev_cum)
+
                     if diff > 0:
                         tick_volume = diff
                     elif diff == 0:
                         tick_volume = 0
                     else:
-                        # 可能跨日、重連或資料重置，先重設基準，不用負數。
                         tick_volume = None
+
                 status["last_cumulative_volume"] = int(cumulative_volume)
 
             if tick_volume is not None:
@@ -623,34 +988,47 @@ class FubonRealtimeManager:
             if tick_volume is not None and tick_volume > 0:
                 if trade_type == "外盤(買)":
                     status["total_buy_vol"] = int(status.get("total_buy_vol", 0) or 0) + tick_volume
+
                 elif trade_type == "內盤(賣)":
                     status["total_sell_vol"] = int(status.get("total_sell_vol", 0) or 0) + tick_volume
 
-                # 不在 WebSocket callback 內使用固定門檻過濾，避免 UI 調整大單張數後仍沿用舊門檻。
-                tick_order = {
+                tick = {
                     "time": now,
                     "price": status.get("last_ws_price"),
                     "volume": int(tick_volume),
                     "type": status.get("last_trade_type", "-"),
                 }
-                recent_orders = status.get("recent_tick_orders", [])
-                recent_orders.append(tick_order)
-                status["recent_tick_orders"] = recent_orders[-200:]
-                status["latest_large_order"] = tick_order
+
+                recent_ticks = status.get("recent_ticks", [])
+                recent_ticks.append(tick)
+
+                status["recent_ticks"] = [
+                    t for t in recent_ticks
+                    if hasattr(t.get("time"), "timestamp")
+                    and (now - t.get("time")).total_seconds() <= 300
+                ][-1500:]
 
             self.tick_status[symbol] = status
 
     def subscribe(self, symbol: str):
         if not self.ws:
             return
+
         code = symbol_to_code(symbol)
+
         if not code or code in self.subscribed:
             return
+
         try:
-            self.ws.subscribe({"channel": "trades", "symbol": code})
+            self.ws.subscribe({
+                "channel": "trades",
+                "symbol": code,
+            })
+
             with self.lock:
                 self.subscribed.add(code)
                 self.error = None
+
         except Exception as e:
             with self.lock:
                 self.error = f"{code} WebSocket 訂閱失敗：{e}"
@@ -661,36 +1039,454 @@ class FubonRealtimeManager:
 
     def get_message(self, symbol: str):
         code = symbol_to_code(symbol)
+
         with self.lock:
             return copy.deepcopy(self.messages.get(code))
 
-    def get_order_status(self, symbol: str, large_order_threshold: int = 50):
+    def get_tick_status(self, symbol: str):
         code = symbol_to_code(symbol)
-        threshold = int(large_order_threshold or 50)
+
         with self.lock:
-            status = copy.deepcopy(self.tick_status.get(code, {
-                "last_ws_price": None,
-                "last_cumulative_volume": None,
-                "real_tick_volume": None,
-                "last_trade_type": "-",
-                "total_buy_vol": 0,
-                "total_sell_vol": 0,
-                "recent_tick_orders": [],
-                "latest_large_order": None,
-            }))
+            return copy.deepcopy(self.tick_status.get(code, self._default_status()))
 
-        latest_large_order = None
-        for order in reversed(status.get("recent_tick_orders", [])):
-            if int(order.get("volume") or 0) >= threshold:
-                latest_large_order = order
-                break
+    def _sum_tick_volume(self, ticks, start_ts, end_ts, trade_type=None):
+        total = 0
 
-        status["latest_large_order"] = latest_large_order
-        if latest_large_order:
-            status["large_order_text"] = self._format_large_order_text(latest_large_order)
+        for tick in ticks:
+            tick_time = tick.get("time")
+
+            if not hasattr(tick_time, "timestamp"):
+                continue
+
+            ts = tick_time.timestamp()
+
+            if start_ts <= ts < end_ts:
+                if trade_type is None or tick.get("type") == trade_type:
+                    try:
+                        total += int(tick.get("volume") or 0)
+                    except Exception:
+                        pass
+
+        return total
+
+    def _price_at_or_before(self, price_points, target_ts):
+        """
+        取得「在 target_ts 當下」真正有效的成交價，也就是時間 <= target_ts
+        的最後一筆成交。這是計算「N 秒前價格」正確的做法：
+        如果某檔股票冷清一陣子（例如 8 秒沒成交），然後突然爆量急拉，
+        用「>= target_ts 的第一筆」當基準會抓到剛好是急拉的那一筆本身，
+        導致漲幅算出來是 0%，完全抓不到訊號。
+        改用「<= target_ts 的最後一筆」，急拉前最後成交價才是正確基準。
+        若真的完全沒有更早的資料（剛開始監控），則退而求其次用
+        目前手上最早的一筆價格做近似基準，避免直接回傳 None 而漏掉訊號。
+        """
+        before = None
+        earliest = None
+
+        for point in price_points:
+            point_time = point.get("time")
+            price = self._safe_float(point.get("price"))
+
+            if not hasattr(point_time, "timestamp") or price is None or price <= 0:
+                continue
+
+            ts = point_time.timestamp()
+
+            if earliest is None or ts < earliest.get("time").timestamp():
+                earliest = point
+
+            if ts <= target_ts:
+                if before is None or ts > before.get("time").timestamp():
+                    before = point
+
+        chosen = before if before is not None else earliest
+
+        if chosen is None:
+            return None
+
+        return self._safe_float(chosen.get("price"))
+
+    def _price_change_from_seconds(self, price_points, current_price, seconds):
+        if current_price is None:
+            return None
+
+        now = datetime.now(TW_TZ)
+        target_ts = now.timestamp() - seconds
+        base_price = self._price_at_or_before(price_points, target_ts)
+
+        if base_price is None or base_price <= 0:
+            return None
+
+        return (float(current_price) / float(base_price) - 1) * 100
+
+    def _last_tick_jump_pct(self, recent_ticks, current_price):
+        """
+        單筆跳動幅度：目前成交價 相對於「上一筆成交價」的漲幅。
+        用來抓最極端的狀況——一筆大單直接把價格瞬間打上去，
+        連 2 秒窗口都還沒等到就該提示的情況。
+        """
+        if current_price is None:
+            return None
+
+        valid_ticks = [
+            t for t in recent_ticks
+            if hasattr(t.get("time"), "timestamp")
+            and self._safe_float(t.get("price")) is not None
+            and self._safe_float(t.get("price")) > 0
+        ]
+
+        if len(valid_ticks) < 2:
+            return None
+
+        valid_ticks.sort(key=lambda x: x.get("time"))
+        prev_price = self._safe_float(valid_ticks[-2].get("price"))
+
+        if prev_price is None or prev_price <= 0:
+            return None
+
+        return (float(current_price) / float(prev_price) - 1) * 100
+
+    def get_entry_signal(
+        self,
+        symbol: str,
+        bucket_sec: int = DEFAULT_ENTRY_BUCKET_SEC,
+        track_sec: int = DEFAULT_ENTRY_TRACK_SEC,
+        volume_ratio_threshold: float = DEFAULT_ENTRY_VOLUME_RATIO,
+        price_move_pct: float = DEFAULT_ENTRY_PRICE_MOVE_PCT,
+        early_5s_pct: float = DEFAULT_EARLY_5S_PCT,
+        early_10s_pct: float = DEFAULT_EARLY_10S_PCT,
+        buy_pressure_ratio_threshold: float = DEFAULT_BUY_PRESSURE_RATIO,
+        cooldown_sec: int = DEFAULT_SIGNAL_COOLDOWN_SEC,
+        min_current_volume: int = DEFAULT_MIN_CURRENT_VOLUME,
+        early_2s_pct: float = DEFAULT_EARLY_2S_PCT,
+        tick_jump_pct: float = DEFAULT_TICK_JUMP_PCT,
+        min_ticks_in_bucket: int = DEFAULT_MIN_TICKS_IN_BUCKET,
+    ):
+        code = symbol_to_code(symbol)
+        now = datetime.now(TW_TZ)
+        now_ts = now.timestamp()
+
+        try:
+            bucket_sec = max(5, int(bucket_sec))
+        except Exception:
+            bucket_sec = DEFAULT_ENTRY_BUCKET_SEC
+
+        try:
+            track_sec = max(bucket_sec, int(track_sec))
+        except Exception:
+            track_sec = DEFAULT_ENTRY_TRACK_SEC
+
+        try:
+            volume_ratio_threshold = max(0.1, float(volume_ratio_threshold))
+        except Exception:
+            volume_ratio_threshold = DEFAULT_ENTRY_VOLUME_RATIO
+
+        try:
+            price_move_pct = max(0.1, float(price_move_pct))
+        except Exception:
+            price_move_pct = DEFAULT_ENTRY_PRICE_MOVE_PCT
+
+        try:
+            early_5s_pct = max(0.1, float(early_5s_pct))
+        except Exception:
+            early_5s_pct = DEFAULT_EARLY_5S_PCT
+
+        try:
+            early_10s_pct = max(0.1, float(early_10s_pct))
+        except Exception:
+            early_10s_pct = DEFAULT_EARLY_10S_PCT
+
+        try:
+            buy_pressure_ratio_threshold = max(0.0, min(1.0, float(buy_pressure_ratio_threshold)))
+        except Exception:
+            buy_pressure_ratio_threshold = DEFAULT_BUY_PRESSURE_RATIO
+
+        try:
+            cooldown_sec = max(0, int(cooldown_sec))
+        except Exception:
+            cooldown_sec = DEFAULT_SIGNAL_COOLDOWN_SEC
+
+        try:
+            min_current_volume = max(0, int(min_current_volume))
+        except Exception:
+            min_current_volume = DEFAULT_MIN_CURRENT_VOLUME
+
+        try:
+            early_2s_pct = max(0.05, float(early_2s_pct))
+        except Exception:
+            early_2s_pct = DEFAULT_EARLY_2S_PCT
+
+        try:
+            tick_jump_pct = max(0.05, float(tick_jump_pct))
+        except Exception:
+            tick_jump_pct = DEFAULT_TICK_JUMP_PCT
+
+        try:
+            min_ticks_in_bucket = max(1, int(min_ticks_in_bucket))
+        except Exception:
+            min_ticks_in_bucket = DEFAULT_MIN_TICKS_IN_BUCKET
+
+        with self.lock:
+            status = copy.deepcopy(self.tick_status.get(code, self._default_status()))
+
+        current_price = status.get("last_ws_price")
+        recent_ticks = status.get("recent_ticks", [])
+        price_points = status.get("price_points", [])
+        entry_state = status.get("entry_state") or self._default_status()["entry_state"]
+
+        bucket_start_ts = int(now_ts // bucket_sec) * bucket_sec
+        previous_bucket_start_ts = bucket_start_ts - bucket_sec
+
+        # 視窗剛開始的 1~2 秒，分母太小會讓「預估量」被單一大單放大成離譜倍數
+        # （例如視窗才過 1 秒就來一張大單，除以 1 秒再乘 30 秒 = 30 倍量），
+        # 因此用 BUCKET_ELAPSED_FLOOR_SEC 當作分母下限，避免早期雜訊誤觸發，
+        # 同時仍保留「不用等滿一個視窗才反應」的即時性。
+        elapsed_in_bucket = max(BUCKET_ELAPSED_FLOOR_SEC, now_ts - bucket_start_ts)
+
+        current_volume = self._sum_tick_volume(
+            recent_ticks,
+            bucket_start_ts,
+            now_ts + 0.001,
+        )
+
+        ticks_in_bucket = sum(
+            1 for t in recent_ticks
+            if hasattr(t.get("time"), "timestamp")
+            and bucket_start_ts <= t.get("time").timestamp() < now_ts + 0.001
+        )
+
+        previous_volume = self._sum_tick_volume(
+            recent_ticks,
+            previous_bucket_start_ts,
+            bucket_start_ts,
+        )
+
+        current_buy_volume = self._sum_tick_volume(
+            recent_ticks,
+            bucket_start_ts,
+            now_ts + 0.001,
+            trade_type="外盤(買)",
+        )
+
+        projected_bucket_volume = current_volume / elapsed_in_bucket * bucket_sec
+
+        volume_ratio = None
+        volume_ok = False
+        enough_ticks = ticks_in_bucket >= min_ticks_in_bucket
+
+        if previous_volume > 0:
+            volume_ratio = projected_bucket_volume / previous_volume
+            volume_ok = (
+                volume_ratio >= volume_ratio_threshold
+                and current_volume >= min_current_volume
+                and enough_ticks
+            )
+        elif current_volume >= min_current_volume and enough_ticks:
+            # 前一個視窗完全沒有成交（前段量=0），代表這檔股票原本很冷清。
+            # 這種「從 0 突然噴量」正是最典型的急拉起漲點，不能因為
+            # 分母是 0 算不出量比就放棄判斷，改用「本段量已達最低門檻」直接視為量能達標。
+            volume_ok = True
+
+        buy_pressure_ratio = None
+        buy_pressure_ok = False
+
+        if current_volume > 0:
+            buy_pressure_ratio = current_buy_volume / current_volume
+            buy_pressure_ok = buy_pressure_ratio >= buy_pressure_ratio_threshold
+
+        price_change_2s = self._price_change_from_seconds(price_points, current_price, 2)
+        price_change_5s = self._price_change_from_seconds(price_points, current_price, 5)
+        price_change_10s = self._price_change_from_seconds(price_points, current_price, 10)
+        price_change_30s = self._price_change_from_seconds(price_points, current_price, bucket_sec)
+
+        last_tick_jump_pct = self._last_tick_jump_pct(recent_ticks, current_price)
+
+        short_momentum_ok = (
+            (price_change_2s is not None and price_change_2s >= early_2s_pct)
+            or (price_change_5s is not None and price_change_5s >= early_5s_pct)
+            or (price_change_10s is not None and price_change_10s >= early_10s_pct)
+            or (price_change_30s is not None and price_change_30s >= price_move_pct)
+        )
+
+        track_start_ts = now_ts - track_sec
+        track_prices = []
+
+        for point in price_points:
+            point_time = point.get("time")
+            price = self._safe_float(point.get("price"))
+
+            if not hasattr(point_time, "timestamp") or price is None or price <= 0:
+                continue
+
+            if track_start_ts <= point_time.timestamp() <= now_ts:
+                track_prices.append(price)
+
+        low_track = min(track_prices) if track_prices else None
+        high_track = max(track_prices) if track_prices else None
+
+        rise_from_low_pct = None
+        drop_from_high_pct = None
+        near_high_breakout = False
+
+        if current_price is not None and low_track is not None and low_track > 0:
+            rise_from_low_pct = (float(current_price) / float(low_track) - 1) * 100
+
+        if current_price is not None and high_track is not None and high_track > 0:
+            drop_from_high_pct = (float(current_price) / float(high_track) - 1) * 100
+            near_high_breakout = float(current_price) >= float(high_track) * 0.998
+
+        low_rebound_ok = (
+            rise_from_low_pct is not None
+            and rise_from_low_pct >= price_move_pct
+        )
+
+        position_ok = near_high_breakout or low_rebound_ok
+
+        armed = bool(entry_state.get("armed", False))
+        armed_at = entry_state.get("armed_at")
+        last_signal_at = entry_state.get("last_signal_at")
+
+        cooldown_ok = True
+
+        if hasattr(last_signal_at, "timestamp"):
+            cooldown_ok = (now - last_signal_at).total_seconds() >= cooldown_sec
+
+        if volume_ok and not armed:
+            entry_state["armed"] = True
+            entry_state["armed_at"] = now
+            entry_state["armed_low"] = low_track
+            entry_state["armed_high"] = high_track
+
+        if armed and hasattr(armed_at, "timestamp"):
+            armed_age = (now - armed_at).total_seconds()
+
+            if armed_age > track_sec:
+                entry_state["armed"] = False
+                entry_state["armed_at"] = None
+                entry_state["armed_low"] = None
+                entry_state["armed_high"] = None
+
+        last_trade_type = status.get("last_trade_type", "-")
+
+        warning_active = (
+            volume_ok
+            and buy_pressure_ok
+            and (
+                (price_change_2s is not None and price_change_2s >= early_2s_pct)
+                or (price_change_5s is not None and price_change_5s >= early_5s_pct)
+                or (price_change_10s is not None and price_change_10s >= early_10s_pct)
+            )
+        )
+
+        entry_active = (
+            volume_ok
+            and buy_pressure_ok
+            and short_momentum_ok
+            and position_ok
+            and cooldown_ok
+        )
+
+        # 🔥 極早期訊號（flash）：完全不等視窗量比、也不等 60 秒高低點確認，
+        # 只要「最新一筆是外盤買」且「單筆跳動」或「2 秒漲幅」已經達標，
+        # 就先跳出來提醒。這是三層裡反應最快的一層，代價是雜訊也最多，
+        # 只在還沒達到 warning / entry 時才顯示，避免蓋掉更有把握的訊號。
+        flash_active = (
+            not entry_active
+            and not warning_active
+            and last_trade_type == "外盤(買)"
+            and (
+                (last_tick_jump_pct is not None and last_tick_jump_pct >= tick_jump_pct)
+                or (price_change_2s is not None and price_change_2s >= early_2s_pct)
+            )
+        )
+
+        if entry_active:
+            entry_state["last_signal_at"] = now
+            entry_state["armed"] = False
+            entry_state["armed_at"] = None
+            entry_state["armed_low"] = None
+            entry_state["armed_high"] = None
+
+        with self.lock:
+            self.tick_status.setdefault(code, self._default_status())["entry_state"] = entry_state
+
+        if entry_active:
+            text = (
+                f"🚀 進場訊號｜"
+                f"預估{bucket_sec}秒量 {int(projected_bucket_volume)} / 前{bucket_sec}秒量 {int(previous_volume)}｜"
+                f"量比 {format_ratio_value(volume_ratio)}｜"
+                f"外盤占比 {format_percent_ratio(buy_pressure_ratio)}｜"
+                f"2秒 {format_signed_pct(price_change_2s)}｜"
+                f"5秒 {format_signed_pct(price_change_5s)}｜"
+                f"10秒 {format_signed_pct(price_change_10s)}｜"
+                f"{bucket_sec}秒 {format_signed_pct(price_change_30s)}｜"
+                f"{track_sec}秒低點拉抬 {format_signed_pct(rise_from_low_pct)}"
+            )
+            signal_level = "entry"
+
+        elif warning_active:
+            text = (
+                f"⚠️ 預警｜"
+                f"預估{bucket_sec}秒量 {int(projected_bucket_volume)} / 前{bucket_sec}秒量 {int(previous_volume)}｜"
+                f"量比 {format_ratio_value(volume_ratio)}｜"
+                f"外盤占比 {format_percent_ratio(buy_pressure_ratio)}｜"
+                f"2秒 {format_signed_pct(price_change_2s)}｜"
+                f"5秒 {format_signed_pct(price_change_5s)}｜"
+                f"10秒 {format_signed_pct(price_change_10s)}"
+            )
+            signal_level = "warning"
+
+        elif flash_active:
+            text = (
+                f"🔥 極早期訊號｜"
+                f"單筆跳動 {format_signed_pct(last_tick_jump_pct)}｜"
+                f"2秒 {format_signed_pct(price_change_2s)}｜"
+                f"本段筆數 {ticks_in_bucket}｜"
+                f"外盤買進中，量能與突破條件尚未全部達標，僅供提早注意"
+            )
+            signal_level = "flash"
+
         else:
-            status["large_order_text"] = "監控中"
-        return status
+            text = "監控中"
+            signal_level = "none"
+
+        signal_key = (
+            f"{code}_{int(now_ts // 5)}_{signal_level}_"
+            f"cv{current_volume}_pv{previous_volume}_p{current_price}"
+        )
+
+        return {
+            "active": bool(entry_active),
+            "warning": bool(warning_active),
+            "flash": bool(flash_active),
+            "signal_level": signal_level,
+            "text": text,
+            "time": now,
+            "signal_key": signal_key,
+            "current_price": current_price,
+            "current_volume": int(current_volume),
+            "previous_volume": int(previous_volume),
+            "projected_bucket_volume": int(projected_bucket_volume),
+            "ticks_in_bucket": int(ticks_in_bucket),
+            "volume_ratio": volume_ratio,
+            "buy_pressure_ratio": buy_pressure_ratio,
+            "price_change_2s": price_change_2s,
+            "price_change_5s": price_change_5s,
+            "price_change_10s": price_change_10s,
+            "price_change_30s": price_change_30s,
+            "last_tick_jump_pct": last_tick_jump_pct,
+            "low_track": low_track,
+            "high_track": high_track,
+            "rise_from_low_pct": rise_from_low_pct,
+            "drop_from_high_pct": drop_from_high_pct,
+            "near_high_breakout": near_high_breakout,
+            "volume_ok": volume_ok,
+            "buy_pressure_ok": buy_pressure_ok,
+            "short_momentum_ok": short_momentum_ok,
+            "position_ok": position_ok,
+            "bucket_sec": bucket_sec,
+            "track_sec": track_sec,
+        }
 
     def get_status(self):
         with self.lock:
@@ -711,10 +1507,13 @@ def load_stock_groups():
         try:
             with open(GROUPS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
+
             if isinstance(data, dict) and data:
                 return data
+
         except Exception:
             pass
+
     return copy.deepcopy(DEFAULT_STOCK_GROUPS)
 
 
@@ -725,146 +1524,224 @@ def save_stock_groups(groups):
 
 def save_backup_snapshot(groups):
     os.makedirs(BACKUP_DIR, exist_ok=True)
-    file_path = os.path.join(BACKUP_DIR, f"stock_groups_backup_{datetime.now(TW_TZ).strftime('%Y%m%d_%H%M%S')}.json")
+
+    file_path = os.path.join(
+        BACKUP_DIR,
+        f"stock_groups_backup_{datetime.now(TW_TZ).strftime('%Y%m%d_%H%M%S')}.json",
+    )
+
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(groups, f, ensure_ascii=False, indent=2)
+
     return file_path
 
 
 # =============================================================================
-# Telegram
+# 每日訊號 Log
 # =============================================================================
-def send_telegram_message(text: str):
-    """送出 Telegram 訊息；需要在 Streamlit secrets 設定 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID。"""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+def get_signal_log_path(for_date=None):
+    """
+    每天一個檔案，檔名帶日期，例如 signal_logs/log_20260708.txt。
+    這樣「今天的 log.txt」不會被昨天的紀錄洗掉，也方便之後回顧某一天的訊號。
+    """
+    day = for_date or datetime.now(TW_TZ)
+    os.makedirs(SIGNAL_LOG_DIR, exist_ok=True)
+    return os.path.join(SIGNAL_LOG_DIR, f"log_{day.strftime('%Y%m%d')}.txt")
+
+
+def append_signal_log(group_name, code, stock_name, signal, change_pct):
+    """
+    把一筆訊號（🔥極早期 / ⚠️預警 / 🚀進場）寫進當天的 log 檔。
+    用 signal_key 搭配 session_state 做去重，避免同一個訊號在自動刷新
+    期間被重複寫入同一行好幾次；不同 session（例如重開瀏覽器分頁）
+    仍會各自記一次，但這對「當天完整留存訊號紀錄」的目的影響不大。
+    """
+    if not signal:
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
+
+    level = signal.get("signal_level", "none")
+
+    if level not in ("flash", "warning", "entry"):
+        return
+
+    signal_key = signal.get("signal_key")
+
+    if signal_key:
+        logged_keys = st.session_state.setdefault("signal_log_written_keys", set())
+
+        if signal_key in logged_keys:
+            return
+
+        logged_keys.add(signal_key)
+
+        if len(logged_keys) > 2000:
+            st.session_state.signal_log_written_keys = set(list(logged_keys)[-1000:])
+
+    signal_time = signal.get("time") or datetime.now(TW_TZ)
+    time_text = signal_time.strftime("%Y-%m-%d %H:%M:%S") if hasattr(signal_time, "strftime") else "-"
+
+    level_label = {"flash": "極早期", "warning": "預警", "entry": "進場"}.get(level, level)
+    price_text = format_price_value(signal.get("current_price"))
+    pct_text = format_pct_value(change_pct)
+
+    line = (
+        f"{time_text} | {level_label} | {group_name} | {code} {stock_name} | "
+        f"現價 {price_text} | 漲幅 {pct_text} | {signal.get('text', '')}"
+    )
+
     try:
-        res = requests.post(url, json=payload, timeout=5)
-        if res.status_code != 200:
-            st.error(f"Telegram 傳送失敗，API 回傳：{res.text}")
+        log_path = get_signal_log_path(signal_time if hasattr(signal_time, "strftime") else None)
+
+        with SIGNAL_LOG_LOCK:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
     except Exception as e:
-        st.error(f"Telegram 連線失敗: {e}")
+        # log 寫入失敗不該讓整個監控頁面掛掉，記到 session_state 讓 UI 可以提示錯誤即可
+        st.session_state["signal_log_write_error"] = str(e)
 
 
-# =============================================================================
-# Session State
-# =============================================================================
+def read_signal_log(for_date=None):
+    log_path = get_signal_log_path(for_date)
+
+    if not os.path.exists(log_path):
+        return "", log_path
+
+    try:
+        with open(log_path, "r", encoding="utf-8") as f:
+            return f.read(), log_path
+    except Exception as e:
+        return f"讀取 log 失敗：{e}", log_path
+
+
+
 if "auto_refresh_enabled" not in st.session_state:
     st.session_state.auto_refresh_enabled = True
+
 if "refresh_sec" not in st.session_state:
     st.session_state.refresh_sec = 3
-if "large_order_threshold" not in st.session_state:
-    st.session_state.large_order_threshold = 50
-if "telegram_pct_threshold" not in st.session_state:
-    st.session_state.telegram_pct_threshold = 3.0
+
+if "entry_bucket_sec" not in st.session_state:
+    st.session_state.entry_bucket_sec = DEFAULT_ENTRY_BUCKET_SEC
+
+if "entry_track_sec" not in st.session_state:
+    st.session_state.entry_track_sec = DEFAULT_ENTRY_TRACK_SEC
+
+if "entry_volume_ratio" not in st.session_state:
+    st.session_state.entry_volume_ratio = DEFAULT_ENTRY_VOLUME_RATIO
+
+if "entry_price_move_pct" not in st.session_state:
+    st.session_state.entry_price_move_pct = DEFAULT_ENTRY_PRICE_MOVE_PCT
+
+if "entry_early_5s_pct" not in st.session_state:
+    st.session_state.entry_early_5s_pct = DEFAULT_EARLY_5S_PCT
+
+if "entry_early_10s_pct" not in st.session_state:
+    st.session_state.entry_early_10s_pct = DEFAULT_EARLY_10S_PCT
+
+if "entry_buy_pressure_ratio" not in st.session_state:
+    st.session_state.entry_buy_pressure_ratio = DEFAULT_BUY_PRESSURE_RATIO
+
+if "entry_cooldown_sec" not in st.session_state:
+    st.session_state.entry_cooldown_sec = DEFAULT_SIGNAL_COOLDOWN_SEC
+
+if "entry_min_current_volume" not in st.session_state:
+    st.session_state.entry_min_current_volume = DEFAULT_MIN_CURRENT_VOLUME
+
+if "entry_early_2s_pct" not in st.session_state:
+    st.session_state.entry_early_2s_pct = DEFAULT_EARLY_2S_PCT
+
+if "entry_tick_jump_pct" not in st.session_state:
+    st.session_state.entry_tick_jump_pct = DEFAULT_TICK_JUMP_PCT
+
+if "entry_min_ticks_in_bucket" not in st.session_state:
+    st.session_state.entry_min_ticks_in_bucket = DEFAULT_MIN_TICKS_IN_BUCKET
+
 if "stock_groups" not in st.session_state:
     st.session_state.stock_groups = load_stock_groups()
+
 if "group_editor_unlocked" not in st.session_state:
     st.session_state.group_editor_unlocked = False
+
 if "editing_mode" not in st.session_state:
     st.session_state.editing_mode = False
+
 if "selected_group_editor" not in st.session_state:
     group_names_init = list(st.session_state.stock_groups.keys())
     st.session_state.selected_group_editor = group_names_init[0] if group_names_init else ""
+
 if "rename_group_input" not in st.session_state:
     st.session_state.rename_group_input = st.session_state.selected_group_editor
+
 if "symbols_text_area" not in st.session_state:
     selected = st.session_state.selected_group_editor
     st.session_state.symbols_text_area = "\n".join(st.session_state.stock_groups.get(selected, []))
+
 if "quick_add_symbol_input" not in st.session_state:
     st.session_state.quick_add_symbol_input = ""
+
 if "fubon_manager" not in st.session_state:
     st.session_state.fubon_manager = FubonRealtimeManager()
+
 if "fubon_logged_in" not in st.session_state:
     st.session_state.fubon_logged_in = False
-if "tg_push_enabled" not in st.session_state:
-    st.session_state.tg_push_enabled = False
-if "large_order_toast_keys" not in st.session_state:
-    # 用來避免同一筆大單在自動刷新時重複跳出 toast / Telegram
-    st.session_state.large_order_toast_keys = set()
-if "_large_order_toast_messages" not in st.session_state:
-    # 大單買入 toast 佇列；資料掃描階段加入，畫面輸出前統一顯示
-    st.session_state._large_order_toast_messages = []
+
+if "entry_signal_toast_keys" not in st.session_state:
+    st.session_state.entry_signal_toast_keys = set()
+
+if "_entry_signal_toast_messages" not in st.session_state:
+    st.session_state._entry_signal_toast_messages = []
 
 
 def show_pending_toasts():
-    """顯示右上角 toast。duration='long' 約為 10 秒。"""
     if "_quick_add_success_message" in st.session_state:
         st.toast(st.session_state._quick_add_success_message, duration="long")
         del st.session_state._quick_add_success_message
 
-    messages = st.session_state.get("_large_order_toast_messages", [])
+    messages = st.session_state.get("_entry_signal_toast_messages", [])
+
     if messages:
-        # 避免同一輪太多 toast 佔滿畫面，最多顯示最新 3 則
-        for msg in messages[-3:]:
+        for msg in messages[-5:]:
             st.toast(msg, icon="🚀", duration="long")
-        st.session_state._large_order_toast_messages = []
+        st.session_state._entry_signal_toast_messages = []
 
 
-def queue_large_buy_toast(group_name, code, stock_name, latest, change_pct):
-    """偵測到外盤買入大單時，加入 toast 佇列；若 Telegram 開啟則同步推送。"""
-    if not latest or latest.get("type") != "外盤(買)":
+def queue_entry_signal_toast(group_name, code, stock_name, signal, change_pct):
+    if not signal:
         return
 
-    order_time = latest.get("time")
-    time_key = order_time.strftime("%Y%m%d%H%M%S") if hasattr(order_time, "strftime") else str(order_time)
-    volume = int(latest.get("volume") or 0)
-    price = latest.get("price")
-    toast_key = f"{code}_{time_key}_{volume}_{latest.get('type', '-')}_{price}"
-
-    # 同一筆大單只通知一次，避免自動刷新時重複跳出 toast / Telegram
-    if toast_key in st.session_state.large_order_toast_keys:
+    if not signal.get("active") and not signal.get("warning"):
         return
 
-    time_text = order_time.strftime("%H:%M:%S") if hasattr(order_time, "strftime") else "--:--:--"
-    price_text = f"{float(price):.2f}" if isinstance(price, (int, float)) else "-"
-    pct_text = format_pct_value(change_pct)
+    signal_key = signal.get("signal_key")
 
-    toast_msg = (
-        f"🚀 大單買入偵測\n"
+    if not signal_key:
+        return
+
+    if signal_key in st.session_state.entry_signal_toast_keys:
+        return
+
+    signal_time = signal.get("time")
+    time_text = signal_time.strftime("%H:%M:%S") if hasattr(signal_time, "strftime") else "--:--:--"
+    current_price = signal.get("current_price")
+    price_text = format_price_value(current_price)
+
+    prefix = "🚀 進場訊號" if signal.get("active") else "⚠️ 預警"
+
+    msg = (
+        f"{prefix}\n"
         f"{group_name}｜{code} {stock_name}\n"
-        f"單筆：{volume} 張｜價格：{price_text}\n"
-        f"時間：{time_text}｜漲幅：{pct_text}"
+        f"{signal.get('text')}\n"
+        f"現價：{price_text}｜漲幅：{format_pct_value(change_pct)}｜時間：{time_text}"
     )
-    st.session_state._large_order_toast_messages.append(toast_msg)
 
-    should_send_telegram = False
-    try:
-        if change_pct is not None:
-            pct_threshold = abs(float(st.session_state.get("telegram_pct_threshold", 3.0) or 3.0))
-            should_send_telegram = abs(float(change_pct)) >= pct_threshold
-    except Exception:
-        should_send_telegram = False
+    st.session_state._entry_signal_toast_messages.append(msg)
+    st.session_state.entry_signal_toast_keys.add(signal_key)
 
-    if st.session_state.get("tg_push_enabled", False) and should_send_telegram:
-        yahoo_url = yahoo_quote_url(code)
-        telegram_msg = (
-            f"🚀 <b>大單買入偵測</b>\n"
-            f"分類：{group_name}\n"
-            f"股票：<a href='{yahoo_url}'>{code} {stock_name}</a>\n"
-            f"單筆：<b>{volume}</b> 張\n"
-            f"價格：<b>{price_text}</b>\n"
-            f"時間：{time_text}\n"
-            f"漲幅：{pct_text}\n"
-            f"推送門檻：±{pct_threshold:.1f}%"
-        )
-        send_telegram_message(telegram_msg)
-
-    st.session_state.large_order_toast_keys.add(toast_key)
-
-    # 控制記憶體，保留最近約 500 筆去重紀錄
-    if len(st.session_state.large_order_toast_keys) > 500:
-        st.session_state.large_order_toast_keys = set(list(st.session_state.large_order_toast_keys)[-300:])
+    if len(st.session_state.entry_signal_toast_keys) > 700:
+        st.session_state.entry_signal_toast_keys = set(list(st.session_state.entry_signal_toast_keys)[-400:])
 
 
-# 顯示上一輪 rerun 留下的提示，例如快速新增股票成功
 show_pending_toasts()
 
 
@@ -883,10 +1760,13 @@ def set_next_selected_group(group_name: str):
 if "_next_selected_group" in st.session_state:
     pending_group = st.session_state._next_selected_group
     del st.session_state._next_selected_group
+
     if pending_group in st.session_state.stock_groups:
         st.session_state.selected_group_editor = pending_group
         st.session_state.rename_group_input = pending_group
-        st.session_state.symbols_text_area = "\n".join(st.session_state.stock_groups.get(pending_group, []))
+        st.session_state.symbols_text_area = "\n".join(
+            st.session_state.stock_groups.get(pending_group, [])
+        )
 
 
 # =============================================================================
@@ -905,36 +1785,45 @@ def render_fubon_login():
     status = manager.get_status()
 
     if FubonSDK is None:
-        st.sidebar.error("富邦 SDK 未載入，無法監控盤中大單。")
+        st.sidebar.error("富邦 SDK 未載入，無法監控盤中成交。")
         return
 
     if st.sidebar.button("清除 / 重建富邦連線狀態", width="stretch"):
         st.session_state.fubon_manager = FubonRealtimeManager()
         st.session_state.fubon_logged_in = False
         st.session_state.pop("fubon_login_time", None)
+        st.session_state.entry_signal_toast_keys = set()
         st.rerun()
 
     if st.session_state.fubon_logged_in:
         st.sidebar.success("✅ 富邦 WebSocket 已連線")
         st.sidebar.caption(f"已訂閱：{status['subscribed_count']} 檔")
+
         if status["last_message_at"]:
             st.sidebar.caption(f"最後資料：{status['last_message_at'].strftime('%H:%M:%S')}")
+
         if status["error"]:
             st.sidebar.warning(status["error"])
+
         c1, c2 = st.sidebar.columns(2)
+
         with c1:
-            if st.button("盤中累積歸零", width="stretch"):
+            if st.button("盤中資料歸零", width="stretch"):
                 manager.reset_runtime_data()
+                st.session_state.entry_signal_toast_keys = set()
                 st.rerun()
+
         with c2:
             if st.button("登出", width="stretch"):
                 st.session_state.fubon_manager = FubonRealtimeManager()
                 st.session_state.fubon_logged_in = False
                 st.session_state.pop("fubon_login_time", None)
                 st.rerun()
+
         return
 
     pfx_base64 = get_fubon_pfx_base64()
+
     if not pfx_base64:
         st.sidebar.warning("未設定 st.secrets['fubon']['pfx_base64']，無法登入富邦 WebSocket。")
         return
@@ -943,19 +1832,23 @@ def render_fubon_login():
         f_id = st.text_input("身分證字號", key="fubon_id_input")
         f_pw = st.text_input("富邦登入密碼", key="fubon_pw_input", type="password")
         f_cert_pw = st.text_input("憑證密碼", key="fubon_cert_pw_input", type="password")
+
         if st.button("連線富邦 WebSocket", width="stretch"):
             if not f_id or not f_pw or not f_cert_pw:
                 st.warning("請填寫完整登入資訊")
             else:
                 try:
                     new_manager = FubonRealtimeManager()
+
                     with st.spinner("連線富邦 WebSocket 中..."):
                         new_manager.login(f_id, f_pw, f_cert_pw, pfx_base64)
+
                     st.session_state.fubon_manager = new_manager
                     st.session_state.fubon_logged_in = True
                     st.session_state.fubon_login_time = datetime.now(TW_TZ)
                     st.success("富邦 WebSocket 連線成功")
                     st.rerun()
+
                 except Exception as e:
                     st.session_state.fubon_manager = FubonRealtimeManager()
                     st.session_state.fubon_logged_in = False
@@ -969,10 +1862,12 @@ def render_fubon_login():
 def sync_editor_fields_from_selected_group():
     groups = st.session_state.stock_groups
     selected_group = st.session_state.selected_group_editor
+
     if selected_group not in groups:
         group_names = list(groups.keys())
         selected_group = group_names[0] if group_names else ""
         st.session_state.selected_group_editor = selected_group
+
     st.session_state.rename_group_input = selected_group
     st.session_state.symbols_text_area = "\n".join(groups.get(selected_group, []))
     st.session_state.editing_mode = False
@@ -980,15 +1875,23 @@ def sync_editor_fields_from_selected_group():
 
 def render_group_editor_lock():
     st.sidebar.markdown("## 🔐 分組編輯鎖")
+
     if st.session_state.group_editor_unlocked:
         st.sidebar.success("已解鎖，可編輯股票分組")
+
         if st.sidebar.button("鎖定編輯", key="lock_group_editor_btn", width="stretch"):
             st.session_state.group_editor_unlocked = False
             leave_edit_mode()
             st.rerun()
+
         return
 
-    pin_input = st.sidebar.text_input("請輸入 PIN 碼以編輯分組", type="password", key="group_edit_pin_input")
+    pin_input = st.sidebar.text_input(
+        "請輸入 PIN 碼以編輯分組",
+        type="password",
+        key="group_edit_pin_input",
+    )
+
     if st.sidebar.button("解鎖編輯", key="unlock_group_editor_btn", width="stretch"):
         if pin_input == GROUP_EDIT_PIN:
             st.session_state.group_editor_unlocked = True
@@ -1001,11 +1904,13 @@ def render_group_editor_lock():
 def render_stock_group_editor():
     st.sidebar.markdown("## 🛠️ 股票分組編輯")
     groups = st.session_state.stock_groups
+
     if not groups:
         groups = copy.deepcopy(DEFAULT_STOCK_GROUPS)
         st.session_state.stock_groups = groups
 
     group_names = list(groups.keys())
+
     if st.session_state.selected_group_editor not in group_names:
         st.session_state.selected_group_editor = group_names[0]
         st.session_state.rename_group_input = group_names[0]
@@ -1013,8 +1918,10 @@ def render_stock_group_editor():
 
     with st.sidebar.expander("➕ 新增分類", expanded=False):
         new_group_name = st.text_input("分類名稱", key="new_group_name_input")
+
         if st.button("新增分類", key="add_group_btn", width="stretch"):
             name = new_group_name.strip()
+
             if not name:
                 st.warning("請輸入分類名稱")
             elif name in groups:
@@ -1027,15 +1934,39 @@ def render_stock_group_editor():
                 st.rerun()
 
     with st.sidebar.expander("📝 編輯分類", expanded=True):
-        st.selectbox("選擇分類", options=group_names, key="selected_group_editor", on_change=sync_editor_fields_from_selected_group)
+        st.selectbox(
+            "選擇分類",
+            options=group_names,
+            key="selected_group_editor",
+            on_change=sync_editor_fields_from_selected_group,
+        )
+
         selected_group = st.session_state.selected_group_editor
-        new_group_name = st.text_input("分類名稱（可修改）", key="rename_group_input", on_change=enter_edit_mode)
-        symbols_text = st.text_area("股票清單（每行一檔，或逗號分隔）", height=180, key="symbols_text_area", on_change=enter_edit_mode)
+
+        new_group_name = st.text_input(
+            "分類名稱（可修改）",
+            key="rename_group_input",
+            on_change=enter_edit_mode,
+        )
+
+        symbols_text = st.text_area(
+            "股票清單（每行一檔，或逗號分隔）",
+            height=180,
+            key="symbols_text_area",
+            on_change=enter_edit_mode,
+        )
 
         st.markdown("### ⚡ 快速新增股票")
-        quick_input = st.text_input("輸入股票代碼或名稱", key="quick_add_symbol_input", on_change=enter_edit_mode)
+
+        quick_input = st.text_input(
+            "輸入股票代碼或名稱",
+            key="quick_add_symbol_input",
+            on_change=enter_edit_mode,
+        )
+
         if quick_input.strip():
             symbol, stock_name, _ = resolve_stock_query(quick_input)
+
             if symbol:
                 st.caption(f"查詢結果：{stock_name} / 將加入：{symbol}")
             else:
@@ -1043,10 +1974,12 @@ def render_stock_group_editor():
 
         if st.button("加入目前分類", key="quick_add_btn", width="stretch"):
             symbol, stock_name, _ = resolve_stock_query(quick_input)
+
             if not symbol:
                 st.warning("請輸入股票代碼或股票名稱")
             else:
                 current = groups.get(selected_group, [])
+
                 if symbol in current:
                     st.warning("此股票已存在於目前分類")
                 else:
@@ -1055,29 +1988,39 @@ def render_stock_group_editor():
                     st.session_state.stock_groups = groups
                     save_stock_groups(groups)
                     set_next_selected_group(selected_group)
+
                     if stock_name:
                         st.session_state._quick_add_success_message = f"已加入 {symbol}（{stock_name}）"
                     else:
                         st.session_state._quick_add_success_message = f"已加入 {symbol}"
+
                     st.rerun()
 
         c1, c2 = st.columns(2)
+
         with c1:
             if st.button("💾 儲存分類", key="save_group_btn", width="stretch"):
                 new_name = new_group_name.strip()
+
                 if not new_name:
                     st.warning("分類名稱不可為空")
                 elif new_name != selected_group and new_name in groups:
                     st.warning("分類名稱已存在")
                 else:
                     updated = {}
+
                     for k, v in groups.items():
-                        updated[new_name if k == selected_group else k] = normalize_symbols_from_text(symbols_text) if k == selected_group else v
+                        if k == selected_group:
+                            updated[new_name] = normalize_symbols_from_text(symbols_text)
+                        else:
+                            updated[k] = v
+
                     st.session_state.stock_groups = updated
                     save_stock_groups(updated)
                     leave_edit_mode()
                     set_next_selected_group(new_name)
                     st.rerun()
+
         with c2:
             if st.button("🗑️ 刪除分類", key="delete_group_btn", width="stretch"):
                 if len(groups) <= 1:
@@ -1091,20 +2034,43 @@ def render_stock_group_editor():
                     st.rerun()
 
     with st.sidebar.expander("📦 匯出 / 匯入 / 重設", expanded=False):
-        export_json = json.dumps(st.session_state.stock_groups, ensure_ascii=False, indent=2)
-        st.download_button("⬇️ 匯出目前分組 JSON", data=export_json, file_name="stock_groups.json", mime="application/json", width="stretch")
+        export_json = json.dumps(
+            st.session_state.stock_groups,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+        st.download_button(
+            "⬇️ 匯出目前分組 JSON",
+            data=export_json,
+            file_name="stock_groups.json",
+            mime="application/json",
+            width="stretch",
+        )
+
         uploaded_file = st.file_uploader("上傳股票分組 JSON", type=["json"])
+
         if uploaded_file is not None and st.button("📥 匯入並覆蓋目前分組", width="stretch"):
             try:
                 data = json.loads(uploaded_file.read().decode("utf-8"))
+
                 if not isinstance(data, dict) or not data:
                     raise ValueError("JSON 最外層必須是非空物件")
+
                 save_backup_snapshot(st.session_state.stock_groups)
-                validated = {str(k).strip(): normalize_symbols_from_text("\n".join(v) if isinstance(v, list) else str(v)) for k, v in data.items()}
+
+                validated = {
+                    str(k).strip(): normalize_symbols_from_text(
+                        "\n".join(v) if isinstance(v, list) else str(v)
+                    )
+                    for k, v in data.items()
+                }
+
                 st.session_state.stock_groups = validated
                 save_stock_groups(validated)
                 set_next_selected_group(list(validated.keys())[0])
                 st.rerun()
+
             except Exception as e:
                 st.error(f"JSON 匯入失敗：{e}")
 
@@ -1113,6 +2079,7 @@ def render_stock_group_editor():
                 save_backup_snapshot(st.session_state.stock_groups)
             except Exception:
                 pass
+
             st.session_state.stock_groups = copy.deepcopy(DEFAULT_STOCK_GROUPS)
             save_stock_groups(st.session_state.stock_groups)
             set_next_selected_group(list(st.session_state.stock_groups.keys())[0])
@@ -1124,242 +2091,536 @@ def render_stock_group_editor():
 # =============================================================================
 if os.path.exists(APP_LOGO):
     title_icon_col, title_text_col = st.columns([0.45, 8])
+
     with title_icon_col:
         st.image(APP_LOGO, width=58)
-    with title_text_col:
-        st.markdown("## ⚡ 盤中大單進出監控")
-else:
-    st.markdown("## ⚡ 盤中大單進出監控")
 
-control_col1, control_col2, control_col3, control_col4, control_col5, control_col6, control_col7 = st.columns([1, 1, 1, 1, 1, 1, 1])
-with control_col1:
-    if st.button("🔄 手動刷新畫面", width="stretch"):
+    with title_text_col:
+        st.markdown("## 🚀 盤中瞬間拉抬進場監控")
+else:
+    st.markdown("## 🚀 盤中瞬間拉抬進場監控")
+
+
+control_cols = st.columns(14)
+
+with control_cols[0]:
+    if st.button("🔄 手動刷新", width="stretch"):
         st.rerun()
-with control_col2:
+
+with control_cols[1]:
     st.toggle("⏱️ 自動刷新", key="auto_refresh_enabled")
-with control_col3:
-    tg_push = st.toggle(
-        "📲 Telegram 推送開關",
-        value=st.session_state.tg_push_enabled,
-        help="必須開啟此選項，機器人才會依推送漲跌幅門檻發送大單買入推播",
-    )
-    if tg_push != st.session_state.tg_push_enabled:
-        st.session_state.tg_push_enabled = tg_push
-        st.rerun()
-with control_col4:
-    st.number_input("刷新秒數", min_value=1, max_value=60, step=1, key="refresh_sec")
-with control_col5:
-    st.number_input("大單門檻（張）", min_value=1, step=10, key="large_order_threshold")
-with control_col6:
+
+with control_cols[2]:
     st.number_input(
-        "推送漲跌幅門檻 (%)",
+        "刷新秒數",
+        min_value=1,
+        max_value=60,
+        step=1,
+        key="refresh_sec",
+    )
+
+with control_cols[3]:
+    pct_threshold = st.number_input(
+        "漲幅門檻%",
         min_value=0.0,
         max_value=10.0,
+        value=2.0,
         step=0.5,
-        key="telegram_pct_threshold",
-        help="Telegram 推送條件：漲跌幅絕對值 >= 此數字，且同時有大單買入。預設 3%。",
     )
-with control_col7:
-    pct_threshold = st.number_input("漲幅門檻 (%)", min_value=0.0, max_value=10.0, value=5.0, step=0.5)
+
+with control_cols[4]:
+    st.number_input(
+        "量能視窗秒",
+        min_value=5,
+        max_value=120,
+        step=5,
+        key="entry_bucket_sec",
+    )
+
+with control_cols[5]:
+    st.number_input(
+        "高低點追蹤秒",
+        min_value=10,
+        max_value=300,
+        step=10,
+        key="entry_track_sec",
+    )
+
+with control_cols[6]:
+    st.number_input(
+        "量比門檻",
+        min_value=0.1,
+        max_value=10.0,
+        step=0.1,
+        key="entry_volume_ratio",
+    )
+
+with control_cols[7]:
+    st.number_input(
+        "價格變動%",
+        min_value=0.1,
+        max_value=10.0,
+        step=0.1,
+        key="entry_price_move_pct",
+    )
+
+with control_cols[8]:
+    st.number_input(
+        "外盤占比",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.05,
+        key="entry_buy_pressure_ratio",
+        help="0.55 = 外盤占比 55%",
+    )
+
+with control_cols[9]:
+    st.number_input(
+        "最低本段量",
+        min_value=0,
+        max_value=10000,
+        step=10,
+        key="entry_min_current_volume",
+    )
+
+with control_cols[10]:
+    st.number_input(
+        "冷卻秒數",
+        min_value=0,
+        max_value=300,
+        step=5,
+        key="entry_cooldown_sec",
+    )
+
+with control_cols[11]:
+    st.number_input(
+        "2秒預警%",
+        min_value=0.1,
+        max_value=5.0,
+        step=0.1,
+        key="entry_early_2s_pct",
+        help="極短窗口漲幅門檻，比5秒窗更快抓到瞬間拉抬",
+    )
+
+with control_cols[12]:
+    st.number_input(
+        "單筆跳動%",
+        min_value=0.1,
+        max_value=5.0,
+        step=0.1,
+        key="entry_tick_jump_pct",
+        help="最新一筆成交價相較上一筆的漲幅，抓單筆巨量瞬間跳價（🔥極早期訊號用）",
+    )
+
+with control_cols[13]:
+    st.number_input(
+        "視窗最少筆數",
+        min_value=1,
+        max_value=20,
+        step=1,
+        key="entry_min_ticks_in_bucket",
+        help="量能視窗內至少要有幾筆成交才算數，避免單一大單誤觸發",
+    )
+
 
 render_fubon_login()
 render_group_editor_lock()
+
 if st.session_state.group_editor_unlocked:
     render_stock_group_editor()
 else:
     st.sidebar.info("目前為唯讀模式：輸入 PIN 後才能修改股票分組")
+
 
 manager = st.session_state.fubon_manager
 
 if st.session_state.fubon_logged_in:
     login_time = st.session_state.get("fubon_login_time")
     can_subscribe = True
+
     if login_time:
         can_subscribe = (datetime.now(TW_TZ) - login_time).total_seconds() >= 1
+
     if can_subscribe:
         all_symbols = []
+
         for stocks in st.session_state.stock_groups.values():
             all_symbols.extend(stocks)
+
         manager.subscribe_many(all_symbols)
     else:
         st.sidebar.info("等待富邦 WebSocket 連線穩定後訂閱股票...")
 
+
 status = manager.get_status()
+
 st.caption(f"更新時間：{datetime.now(TW_TZ).strftime('%Y-%m-%d %H:%M:%S')}")
+
 if status["connected"]:
     st.success(f"富邦 WebSocket 已連線｜已訂閱 {status['subscribed_count']} 檔")
 else:
     st.warning("富邦 WebSocket 尚未連線。請先在左側登入富邦，否則表格只會顯示監控中。")
+
 if status["last_message_at"]:
     st.caption(f"最後收到資料：{status['last_message_at'].strftime('%H:%M:%S')}")
+
 if status["error"]:
     st.error(status["error"])
 
-st.info("即時價由富邦 WebSocket trades 抓取；最新單筆 = 富邦盤中累積成交量差值；漲幅% = 富邦即時價 ÷ yfinance 昨日收盤價 - 1。yfinance 昨收每小時更新一次並存入 yf_yesterday_close_cache.json。")
+st.info(
+    "訊號邏輯（三層）：\n"
+    "🔥 極早期訊號：最新一筆是外盤買，且單筆跳動或2秒漲幅已達標，最快、雜訊也最多，僅供提早注意。\n"
+    "⚠️ 預警：量能達標＋外盤占比達標＋2/5/10秒任一短線漲幅達標。\n"
+    "🚀 進場訊號：預警條件全部成立，再加上30秒漲幅或60秒突破高點/低點急拉確認，並通過冷卻時間。\n"
+    "（已修正：前段量為0時的爆量偵測、5/10/30秒漲幅的基準價計算bug、視窗剛開始時預估量被單筆大單誤放大的問題）"
+)
 
-# ===== 先整理資料：同一份資料同時產生儀表板與表格 =====
+st.caption(
+    f"✅ 目前條件：量能視窗 {int(st.session_state.entry_bucket_sec)} 秒｜"
+    f"預估量比 ≥ {float(st.session_state.entry_volume_ratio):.2f}x｜"
+    f"價格變動 ≥ {float(st.session_state.entry_price_move_pct):.1f}%｜"
+    f"2秒預警 ≥ {float(st.session_state.entry_early_2s_pct):.1f}%｜"
+    f"5秒預警 ≥ {float(st.session_state.entry_early_5s_pct):.1f}%｜"
+    f"10秒預警 ≥ {float(st.session_state.entry_early_10s_pct):.1f}%｜"
+    f"單筆跳動 ≥ {float(st.session_state.entry_tick_jump_pct):.1f}%｜"
+    f"外盤占比 ≥ {float(st.session_state.entry_buy_pressure_ratio) * 100:.0f}%｜"
+    f"高低點追蹤 {int(st.session_state.entry_track_sec)} 秒｜"
+    f"最低本段量 {int(st.session_state.entry_min_current_volume)} 張｜"
+    f"視窗最少筆數 {int(st.session_state.entry_min_ticks_in_bucket)} 筆｜"
+    f"冷卻 {int(st.session_state.entry_cooldown_sec)} 秒"
+)
+
+
+# =============================================================================
+# 整理資料
+# =============================================================================
 group_tables = {}
 dashboard_items = []
-recent_large_orders = []
-yf_source_count = {"yfinance": 0, "cache": 0, "stale cache": 0, "missing": 0}
+recent_signals = []
+
+yf_source_count = {
+    "yfinance": 0,
+    "cache": 0,
+    "stale cache": 0,
+    "missing": 0,
+}
 
 for group_name, stocks in st.session_state.stock_groups.items():
     rows = []
-    large_order_count = 0
-    large_buy_count = 0
-    large_sell_count = 0
     pct_hit_count = 0
     known_pct_count = 0
     up_count = 0
     down_count = 0
+    warning_count = 0
+    entry_count = 0
+    flash_count = 0
     top_pct_items = []
-    group_large_messages = []
+    group_signal_messages = []
 
     for symbol in stocks:
         code = symbol_to_code(symbol)
         stock_name = get_stock_name(symbol)
-        order_status = manager.get_order_status(symbol, st.session_state.large_order_threshold) if manager is not None else {}
-        tick_vol = order_status.get("real_tick_volume")
-        current_price = order_status.get("last_ws_price")
+
+        tick_status = manager.get_tick_status(symbol) if manager is not None else {}
+
+        tick_vol = tick_status.get("real_tick_volume")
+        current_price = tick_status.get("last_ws_price")
+        trade_type = tick_status.get("last_trade_type", "-")
+        total_buy_vol = int(tick_status.get("total_buy_vol", 0) or 0)
+        total_sell_vol = int(tick_status.get("total_sell_vol", 0) or 0)
+
+        signal = manager.get_entry_signal(
+            symbol,
+            bucket_sec=st.session_state.entry_bucket_sec,
+            track_sec=st.session_state.entry_track_sec,
+            volume_ratio_threshold=st.session_state.entry_volume_ratio,
+            price_move_pct=st.session_state.entry_price_move_pct,
+            early_5s_pct=st.session_state.entry_early_5s_pct,
+            early_10s_pct=st.session_state.entry_early_10s_pct,
+            buy_pressure_ratio_threshold=st.session_state.entry_buy_pressure_ratio,
+            cooldown_sec=st.session_state.entry_cooldown_sec,
+            min_current_volume=st.session_state.entry_min_current_volume,
+            early_2s_pct=st.session_state.entry_early_2s_pct,
+            tick_jump_pct=st.session_state.entry_tick_jump_pct,
+            min_ticks_in_bucket=st.session_state.entry_min_ticks_in_bucket,
+        ) if manager is not None else {
+            "active": False,
+            "warning": False,
+            "signal_level": "none",
+            "text": "監控中",
+        }
+
         yesterday_close, close_date, yf_source = get_yfinance_yesterday_close(symbol)
+
         if yf_source in yf_source_count:
             yf_source_count[yf_source] += 1
         elif yesterday_close is None:
             yf_source_count["missing"] += 1
 
         change_pct = None
+
         if current_price is not None and yesterday_close is not None and yesterday_close > 0:
             change_pct = (float(current_price) / float(yesterday_close) - 1) * 100
 
-        large_text = order_status.get("large_order_text", "監控中")
-        if large_text != "監控中" and change_pct is not None:
-            large_text = f"{large_text}｜{format_pct_value(change_pct)}"
-        latest = order_status.get("latest_large_order")
-        trade_type = order_status.get("last_trade_type", "-")
-
         if change_pct is not None:
             known_pct_count += 1
+
             if float(change_pct) > 0:
                 up_count += 1
             elif float(change_pct) < 0:
                 down_count += 1
-            top_pct_items.append({"code": code, "name": stock_name, "pct": float(change_pct)})
+
+            top_pct_items.append({
+                "code": code,
+                "name": stock_name,
+                "pct": float(change_pct),
+            })
+
             if float(change_pct) >= float(pct_threshold):
                 pct_hit_count += 1
 
-        if latest:
-            large_order_count += 1
-            if latest.get("type") == "外盤(買)":
-                large_buy_count += 1
-            elif latest.get("type") == "內盤(賣)":
-                large_sell_count += 1
-            msg = {"group": group_name, "code": code, "name": stock_name, "text": large_text, "time": latest.get("time"), "pct": change_pct, "type": latest.get("type", "-")}
-            group_large_messages.append(msg)
-            recent_large_orders.append(msg)
+        if signal.get("active"):
+            entry_count += 1
+        elif signal.get("warning"):
+            warning_count += 1
+        elif signal.get("flash"):
+            flash_count += 1
 
-            # ✅ 右上角 toast + Telegram：監控到「外盤(買)」大單時通知
-            queue_large_buy_toast(group_name, code, stock_name, latest, change_pct)
+        if signal.get("active") or signal.get("warning") or signal.get("flash"):
+            signal_msg = {
+                "group": group_name,
+                "code": code,
+                "name": stock_name,
+                "text": signal.get("text", ""),
+                "time": signal.get("time"),
+                "pct": change_pct,
+                "level": signal.get("signal_level", "none"),
+            }
+
+            group_signal_messages.append(signal_msg)
+            recent_signals.append(signal_msg)
+            queue_entry_signal_toast(group_name, code, stock_name, signal, change_pct)
+            append_signal_log(group_name, code, stock_name, signal, change_pct)
 
         rows.append({
             "代碼": yahoo_quote_url(symbol),
             "股票名稱": stock_name,
-            "大單追蹤": large_text,
+            "進場訊號": signal.get("text", "監控中"),
             "即時價": format_price_value(current_price),
             "漲幅%": format_pct_value(change_pct),
             "最新單筆": "-" if tick_vol is None else f"{tick_vol} 張",
             "內外盤": trade_type,
-            "外盤累積": int(order_status.get("total_buy_vol", 0) or 0),
-            "內盤累積": int(order_status.get("total_sell_vol", 0) or 0),
+            "外盤累積": total_buy_vol,
+            "內盤累積": total_sell_vol,
+            "本段量": signal.get("current_volume", 0),
+            "本段筆數": signal.get("ticks_in_bucket", 0),
+            "前段量": signal.get("previous_volume", 0),
+            "預估本段量": signal.get("projected_bucket_volume", 0),
+            "量比": format_ratio_value(signal.get("volume_ratio")),
+            "外盤占比": format_percent_ratio(signal.get("buy_pressure_ratio")),
+            "單筆跳動": format_signed_pct(signal.get("last_tick_jump_pct")),
+            "2秒漲幅": format_signed_pct(signal.get("price_change_2s")),
+            "5秒漲幅": format_signed_pct(signal.get("price_change_5s")),
+            "10秒漲幅": format_signed_pct(signal.get("price_change_10s")),
+            "30秒漲幅": format_signed_pct(signal.get("price_change_30s")),
+            "60秒低點": format_price_value(signal.get("low_track")),
+            "60秒高點": format_price_value(signal.get("high_track")),
+            "低點拉抬": format_signed_pct(signal.get("rise_from_low_pct")),
+            "高點回落": format_signed_pct(signal.get("drop_from_high_pct")),
             "昨收日期": close_date or "-",
             "昨收來源": yf_source,
         })
 
     top_pct_items.sort(key=lambda x: x["pct"], reverse=True)
+
     top_pct_text = "｜".join([
-        f'<span class="{pct_class(item["pct"])}">{escape_html(item["code"])} {escape_html(item["name"])} {item["pct"]:+.2f}%</span>'
+        (
+            f'<span class="{pct_class(item["pct"])}">'
+            f'{escape_html(item["code"])} {escape_html(item["name"])} {item["pct"]:+.2f}%'
+            f'</span>'
+        )
         for item in top_pct_items[:3]
     ]) or "尚無漲幅資料"
 
-    group_large_messages.sort(key=lambda x: x["time"] or datetime.min.replace(tzinfo=TW_TZ), reverse=True)
-    large_msg_text = "<br>".join([
+    group_signal_messages.sort(
+        key=lambda x: x["time"] or datetime.min.replace(tzinfo=TW_TZ),
+        reverse=True,
+    )
+
+    signal_text = "<br>".join([
         f'▸ {escape_html(item["code"])} {escape_html(item["name"])}：{escape_html(item["text"])}'
-        for item in group_large_messages[:3]
-    ]) or "尚無大單"
+        for item in group_signal_messages[:3]
+    ]) or "尚無訊號"
 
     pct_hit_ratio = (pct_hit_count / len(stocks) * 100) if len(stocks) else 0
+
     dashboard_items.append({
         "group": group_name,
         "total": len(stocks),
-        "large_order_count": large_order_count,
-        "large_buy_count": large_buy_count,
-        "large_sell_count": large_sell_count,
         "pct_hit_count": pct_hit_count,
         "known_pct_count": known_pct_count,
         "pct_hit_ratio": pct_hit_ratio,
         "up_count": up_count,
         "down_count": down_count,
+        "warning_count": warning_count,
+        "entry_count": entry_count,
+        "flash_count": flash_count,
         "top_pct_text": top_pct_text,
-        "large_msg_text": large_msg_text,
+        "signal_text": signal_text,
     })
-    group_tables[group_name] = pd.DataFrame(rows, columns=["代碼", "股票名稱", "大單追蹤", "即時價", "漲幅%", "最新單筆", "內外盤", "外盤累積", "內盤累積", "昨收日期", "昨收來源"])
 
-# 顯示本輪掃描到的大單買入 toast
+    group_tables[group_name] = pd.DataFrame(
+        rows,
+        columns=[
+            "代碼",
+            "股票名稱",
+            "進場訊號",
+            "即時價",
+            "漲幅%",
+            "最新單筆",
+            "內外盤",
+            "外盤累積",
+            "內盤累積",
+            "本段量",
+            "本段筆數",
+            "前段量",
+            "預估本段量",
+            "量比",
+            "外盤占比",
+            "單筆跳動",
+            "2秒漲幅",
+            "5秒漲幅",
+            "10秒漲幅",
+            "30秒漲幅",
+            "60秒低點",
+            "60秒高點",
+            "低點拉抬",
+            "高點回落",
+            "昨收日期",
+            "昨收來源",
+        ],
+    )
+
+
 show_pending_toasts()
 
-# ===== 儀表板 =====
-st.markdown('<div id="dashboard-top" style="scroll-margin-top: 90px;"></div>', unsafe_allow_html=True)
-st.markdown("### 📌 大單追蹤儀表板")
-st.caption(f"大單門檻：單筆 ≥ {st.session_state.large_order_threshold} 張｜漲幅達標門檻：≥ {pct_threshold:.1f}%｜Telegram 推送門檻：漲跌幅 ≥ ±{st.session_state.telegram_pct_threshold:.1f}%｜yfinance 昨收快取：{YF_CLOSE_CACHE_TTL_SEC//60} 分鐘")
-st.caption(f"昨收來源統計：yfinance 即時更新 {yf_source_count['yfinance']} 檔｜快取 {yf_source_count['cache']} 檔｜舊快取 {yf_source_count['stale cache']} 檔｜缺資料 {yf_source_count['missing']} 檔")
+
+# =============================================================================
+# 儀表板
+# =============================================================================
+st.markdown(
+    '<div id="dashboard-top" style="scroll-margin-top: 90px;"></div>',
+    unsafe_allow_html=True,
+)
+
+st.markdown("### 📌 瞬間拉抬進場儀表板")
+
+st.caption(
+    f"漲幅達標門檻：≥ {pct_threshold:.1f}%｜"
+    f"量能視窗：{int(st.session_state.entry_bucket_sec)} 秒｜"
+    f"預估量比門檻：{float(st.session_state.entry_volume_ratio):.2f}x｜"
+    f"外盤占比：{float(st.session_state.entry_buy_pressure_ratio) * 100:.0f}%｜"
+    f"價格變動門檻：{float(st.session_state.entry_price_move_pct):.1f}%｜"
+    f"高低點追蹤：{int(st.session_state.entry_track_sec)} 秒｜"
+    f"yfinance 昨收快取：{YF_CLOSE_CACHE_TTL_SEC // 60} 分鐘"
+)
+
+st.caption(
+    f"昨收來源統計："
+    f"yfinance 即時更新 {yf_source_count['yfinance']} 檔｜"
+    f"快取 {yf_source_count['cache']} 檔｜"
+    f"舊快取 {yf_source_count['stale cache']} 檔｜"
+    f"缺資料 {yf_source_count['missing']} 檔"
+)
 
 card_html_parts = ['<div class="dashboard-grid">']
+
 for item in dashboard_items:
-    pct_ratio = float(item.get("pct_hit_ratio", 0) or 0)
-    if pct_ratio >= 70:
-        card_class = "dash-card pct-high"
-    elif pct_ratio >= 40:
-        card_class = "dash-card pct-mid"
-    elif pct_ratio > 0:
-        card_class = "dash-card pct-low"
-    else:
-        card_class = "dash-card pct-zero"
     anchor_id = make_anchor_id(item["group"])
+
+    if item["entry_count"] > 0:
+        card_class = "dash-card entry"
+    elif item["warning_count"] > 0:
+        card_class = "dash-card warn"
+    elif item["flash_count"] > 0:
+        card_class = "dash-card flash"
+    elif item["pct_hit_count"] > 0:
+        card_class = "dash-card normal"
+    else:
+        card_class = "dash-card idle"
+
     card_html_parts.append(
-        f'<a href="#{anchor_id}" class="dashboard-link" title="前往 {escape_html(item["group"])} 明細表；大數字 = 漲幅達標檔數 / 分組總檔數">'
+        f'<a href="#{anchor_id}" class="dashboard-link" title="前往 {escape_html(item["group"])}">'
         f'<div class="{card_class}">'
         f'<div class="dash-title">{escape_html(item["group"])}</div>'
-        f'<div class="dash-big">{item["pct_hit_count"]} / {item["total"]}</div>'
-        f'<div class="dash-line">漲幅達標比例（≥{pct_threshold:.1f}%）：<b>{item["pct_hit_ratio"]:.0f}%</b></div>'
-        f'<div class="dash-line">🎯 達標：<b>{item["pct_hit_count"]}</b> 檔（有漲幅資料 {item["known_pct_count"]} 檔）</div>'
-        f'<div class="dash-line">🔴 一般上漲：<b>{item["up_count"]}</b>　🟢 下跌：<b>{item["down_count"]}</b></div>'
-        f'<div class="dash-line">🚀 外盤大單：<b>{item["large_buy_count"]}</b>　📉 內盤大單：<b>{item["large_sell_count"]}</b></div>'
-        f'<div class="dash-small"><b>大單追蹤</b><br>{item["large_msg_text"]}</div>'
+        f'<div class="dash-big">🚀 {item["entry_count"]}｜⚠️ {item["warning_count"]}｜🔥 {item["flash_count"]}</div>'
+        f'<div class="dash-line">進場訊號：<b>{item["entry_count"]}</b> 檔｜預警：<b>{item["warning_count"]}</b> 檔｜'
+        f'極早期：<b>{item["flash_count"]}</b> 檔</div>'
+        f'<div class="dash-line">漲幅達標（≥{pct_threshold:.1f}%）：'
+        f'<b>{item["pct_hit_count"]} / {item["total"]}</b>，比例 <b>{item["pct_hit_ratio"]:.0f}%</b></div>'
+        f'<div class="dash-line">🔴 上漲：<b>{item["up_count"]}</b> '
+        f'🟢 下跌：<b>{item["down_count"]}</b></div>'
+        f'<div class="dash-small"><b>最新訊號</b><br>{item["signal_text"]}</div>'
         f'<div class="dash-small"><b>漲幅排行</b><br>{item["top_pct_text"]}</div>'
         f'</div></a>'
     )
-card_html_parts.append('</div>')
+
+card_html_parts.append("</div>")
+
 st.markdown("".join(card_html_parts), unsafe_allow_html=True)
 
-recent_large_orders.sort(key=lambda x: x["time"] or datetime.min.replace(tzinfo=TW_TZ), reverse=True)
-if recent_large_orders:
-    st.markdown("#### 🔔 最近大單訊息")
-    recent_cols = st.columns(min(3, len(recent_large_orders)))
-    for idx, item in enumerate(recent_large_orders[:6]):
+
+recent_signals.sort(
+    key=lambda x: x["time"] or datetime.min.replace(tzinfo=TW_TZ),
+    reverse=True,
+)
+
+st.caption(f"本輪掃到訊號：{len(recent_signals)} 檔")
+
+if recent_signals:
+    st.markdown("#### 🚨 最近預警 / 進場訊號")
+    recent_cols = st.columns(min(3, len(recent_signals)))
+
+    for idx, item in enumerate(recent_signals[:6]):
         with recent_cols[idx % len(recent_cols)]:
-            st.info(f"{item['group']}｜{item['code']} {item['name']}\n\n{item['text']}")
+            if item["level"] == "entry":
+                st.error(
+                    f"{item['group']}｜{item['code']} {item['name']}\n\n"
+                    f"{item['text']}"
+                )
+            elif item["level"] == "warning":
+                st.warning(
+                    f"{item['group']}｜{item['code']} {item['name']}\n\n"
+                    f"{item['text']}"
+                )
+            else:
+                st.info(
+                    f"{item['group']}｜{item['code']} {item['name']}\n\n"
+                    f"{item['text']}"
+                )
 
 st.divider()
 
-# ===== 明細表 =====
+
+# =============================================================================
+# 明細表
+# =============================================================================
 for group_name, display_df in group_tables.items():
     anchor_id = make_anchor_id(group_name)
-    st.markdown(f'<div id="{anchor_id}" style="scroll-margin-top: 90px;"></div>', unsafe_allow_html=True)
+
+    st.markdown(
+        f'<div id="{anchor_id}" style="scroll-margin-top: 90px;"></div>',
+        unsafe_allow_html=True,
+    )
+
     table_header_col1, table_header_col2 = st.columns([8, 2])
+
     with table_header_col1:
         st.subheader(f"【{group_name}】({len(display_df)}檔)")
+
     with table_header_col2:
         st.markdown(
-            '<div style="text-align:right; padding-top: 0.6rem;">'
+            '<div class="return-link-wrap">'
             '<a href="#dashboard-top">⬆️ 返回儀表板</a>'
             '</div>',
             unsafe_allow_html=True,
@@ -1370,29 +2631,150 @@ for group_name, display_df in group_tables.items():
         width="stretch",
         hide_index=True,
         column_config={
-            "代碼": st.column_config.LinkColumn("代碼", help="點擊前往 Yahoo 台股個股頁", display_text=r"https://tw.stock.yahoo.com/quote/(.*)"),
+            "代碼": st.column_config.LinkColumn(
+                "代碼",
+                help="點擊前往 Yahoo 台股個股頁",
+                display_text=r"https://tw.stock.yahoo.com/quote/(.*)",
+            ),
             "股票名稱": st.column_config.TextColumn("股票名稱"),
-            "大單追蹤": st.column_config.TextColumn("大單追蹤", help="達到大單門檻時顯示最近一筆大單時間、張數、價格、內外盤與漲幅"),
-            "即時價": st.column_config.TextColumn("即時價", help="由富邦 WebSocket trades 即時成交價取得"),
-            "漲幅%": st.column_config.TextColumn("漲幅%", help="富邦 WebSocket 即時價 / yfinance 昨日收盤價 - 1"),
-            "最新單筆": st.column_config.TextColumn("最新單筆", help="由累積成交量差值換算，不再直接顯示累積成交量"),
+            "進場訊號": st.column_config.TextColumn(
+                "進場訊號",
+                help="預警：預估量放大 + 外盤占比 + 5秒/10秒短線漲幅。進場：再加上突破高點或低點急拉確認。",
+            ),
+            "即時價": st.column_config.TextColumn(
+                "即時價",
+                help="由富邦 WebSocket trades 即時成交價取得",
+            ),
+            "漲幅%": st.column_config.TextColumn(
+                "漲幅%",
+                help="富邦 WebSocket 即時價 / yfinance 昨日收盤價 - 1",
+            ),
+            "最新單筆": st.column_config.TextColumn(
+                "最新單筆",
+                help="優先使用 size；若無 size，則由累積成交量差值換算",
+            ),
             "內外盤": st.column_config.TextColumn("內外盤"),
             "外盤累積": st.column_config.NumberColumn("外盤累積"),
             "內盤累積": st.column_config.NumberColumn("內盤累積"),
+            "本段量": st.column_config.NumberColumn("本段量"),
+            "本段筆數": st.column_config.NumberColumn(
+                "本段筆數",
+                help="量能視窗內的成交筆數，用來過濾單一大單造成的假突破",
+            ),
+            "前段量": st.column_config.NumberColumn("前段量"),
+            "預估本段量": st.column_config.NumberColumn("預估本段量"),
+            "量比": st.column_config.TextColumn("量比"),
+            "外盤占比": st.column_config.TextColumn("外盤占比"),
+            "單筆跳動": st.column_config.TextColumn(
+                "單筆跳動",
+                help="最新一筆成交價相較上一筆成交價的漲幅，抓單筆巨量瞬間跳價",
+            ),
+            "2秒漲幅": st.column_config.TextColumn(
+                "2秒漲幅",
+                help="極短窗口漲幅，反應速度比5秒窗更快",
+            ),
+            "5秒漲幅": st.column_config.TextColumn("5秒漲幅"),
+            "10秒漲幅": st.column_config.TextColumn("10秒漲幅"),
+            "30秒漲幅": st.column_config.TextColumn("30秒漲幅"),
+            "60秒低點": st.column_config.TextColumn("60秒低點"),
+            "60秒高點": st.column_config.TextColumn("60秒高點"),
+            "低點拉抬": st.column_config.TextColumn("低點拉抬"),
+            "高點回落": st.column_config.TextColumn("高點回落"),
             "昨收日期": st.column_config.TextColumn("昨收日期"),
             "昨收來源": st.column_config.TextColumn("昨收來源"),
         },
     )
 
+
+# =============================================================================
+# 每日訊號 Log 檢視 / 下載
+# =============================================================================
+with st.sidebar.expander("📝 今日訊號 Log", expanded=False):
+    today_log_text, today_log_path = read_signal_log()
+    log_line_count = len([ln for ln in today_log_text.splitlines() if ln.strip()])
+
+    st.caption(f"檔案：{today_log_path}｜目前已記錄 {log_line_count} 筆")
+
+    if st.session_state.get("signal_log_write_error"):
+        st.error(f"寫入 log 曾發生錯誤：{st.session_state['signal_log_write_error']}")
+
+    if today_log_text:
+        st.text_area(
+            "今日訊號紀錄（最新在最下面）",
+            value=today_log_text,
+            height=260,
+        )
+        st.download_button(
+            "⬇️ 下載今日 log.txt",
+            data=today_log_text.encode("utf-8"),
+            file_name=os.path.basename(today_log_path),
+            mime="text/plain",
+        )
+    else:
+        st.caption("今天尚無訊號紀錄")
+
+
 with st.sidebar.expander("🔍 WebSocket Debug", expanded=False):
     debug_code = st.text_input("輸入代碼看最後 WS 原始訊息", value="2330")
     msg = manager.get_message(debug_code)
+
     if msg:
         st.caption(f"時間：{msg['time'].strftime('%Y-%m-%d %H:%M:%S')}")
         st.json(msg["raw"])
+
+        debug_signal = manager.get_entry_signal(
+            debug_code,
+            bucket_sec=st.session_state.entry_bucket_sec,
+            track_sec=st.session_state.entry_track_sec,
+            volume_ratio_threshold=st.session_state.entry_volume_ratio,
+            price_move_pct=st.session_state.entry_price_move_pct,
+            early_5s_pct=st.session_state.entry_early_5s_pct,
+            early_10s_pct=st.session_state.entry_early_10s_pct,
+            buy_pressure_ratio_threshold=st.session_state.entry_buy_pressure_ratio,
+            cooldown_sec=st.session_state.entry_cooldown_sec,
+            min_current_volume=st.session_state.entry_min_current_volume,
+            early_2s_pct=st.session_state.entry_early_2s_pct,
+            tick_jump_pct=st.session_state.entry_tick_jump_pct,
+            min_ticks_in_bucket=st.session_state.entry_min_ticks_in_bucket,
+        )
+
+        st.markdown("### 訊號 Debug")
+        st.json({
+            "訊號": debug_signal.get("text"),
+            "訊號等級": debug_signal.get("signal_level"),
+            "本段量": debug_signal.get("current_volume"),
+            "本段筆數": debug_signal.get("ticks_in_bucket"),
+            "前段量": debug_signal.get("previous_volume"),
+            "預估本段量": debug_signal.get("projected_bucket_volume"),
+            "量比": debug_signal.get("volume_ratio"),
+            "外盤占比": debug_signal.get("buy_pressure_ratio"),
+            "單筆跳動": debug_signal.get("last_tick_jump_pct"),
+            "2秒漲幅": debug_signal.get("price_change_2s"),
+            "5秒漲幅": debug_signal.get("price_change_5s"),
+            "10秒漲幅": debug_signal.get("price_change_10s"),
+            "30秒漲幅": debug_signal.get("price_change_30s"),
+            "60秒低點": debug_signal.get("low_track"),
+            "60秒高點": debug_signal.get("high_track"),
+            "低點拉抬": debug_signal.get("rise_from_low_pct"),
+            "突破高點": debug_signal.get("near_high_breakout"),
+            "volume_ok": debug_signal.get("volume_ok"),
+            "buy_pressure_ok": debug_signal.get("buy_pressure_ok"),
+            "short_momentum_ok": debug_signal.get("short_momentum_ok"),
+            "position_ok": debug_signal.get("position_ok"),
+            "flash": debug_signal.get("flash"),
+        })
+
     else:
         st.caption("尚未收到此代碼的 WebSocket 訊息")
 
-if st.session_state.auto_refresh_enabled and not st.session_state.group_editor_unlocked and not st.session_state.editing_mode:
+
+# =============================================================================
+# 自動刷新
+# =============================================================================
+if (
+    st.session_state.auto_refresh_enabled
+    and not st.session_state.group_editor_unlocked
+    and not st.session_state.editing_mode
+):
     time.sleep(int(st.session_state.refresh_sec))
     st.rerun()
